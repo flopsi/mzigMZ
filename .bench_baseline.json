@@ -1,0 +1,8 @@
+{
+  "open": { "us_per_scan": 0.5, "points_per_sec": 0 },
+  "loadScan_full": { "us_per_scan": 150.0, "points_per_sec": 5000000.0 },
+  "loadScanArena_full": { "us_per_scan": 15.0, "points_per_sec": 50000000.0 },
+  "loadScanBulk_full": { "us_per_scan": 5.0, "points_per_sec": 100000000.0 },
+  "loadScan_random_1000": { "us_per_scan": 100.0, "points_per_sec": 10000000.0 },
+  "loadScanBulk_random_1000": { "us_per_scan": 10.0, "points_per_sec": 50000000.0 }
+}

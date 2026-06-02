@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "command": "bash .claude/hooks/auto-format.sh",
+        "timeout": 30000
+      },
+      {
+        "matcher": "Write|Edit",
+        "command": "bash .claude/hooks/protect-sensitive.sh",
+        "timeout": 10000
+      }
+    ]
+  }
+}

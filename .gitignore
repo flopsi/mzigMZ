@@ -1,0 +1,30 @@
+# Zig build artifacts
+.zig-cache/
+zig-cache/
+zig-out/
+
+# Debug / test outputs
+*.tsv
+*.csv
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Secrets
+.env
+*.pem
+*.key
+
+# User data
+fixtures/
+data/
+
+# Agent skills — vendored stdlib snapshots and skill scaffolding
+.pi/skills/zig-quality/sources/
+.pi/skills-main/

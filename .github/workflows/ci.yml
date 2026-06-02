@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  format:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v1
+        with:
+          version: master
+      - name: Check formatting
+        run: zig fmt --check src/
+
+  test:
+    runs-on: windows-latest
+    needs: format
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v1
+        with:
+          version: master
+      - name: Run unit tests
+        run: zig build test
+      - name: Run full test suite (Debug + leak detection)
+        run: zig build test-all
+
+  bench:
+    runs-on: windows-latest
+    needs: test
+    if: github.event_name == 'pull_request' || github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Zig
+        uses: mlugg/setup-zig@v1
+        with:
+          version: master
+      - name: Build benchmark
+        run: zig build install
+      - name: Run benchmark & check regression
+        if: hashFiles('fixtures/test.raw') != ''
+        shell: bash
+        run: |
+          ./zig-out/bin/bench.exe fixtures/test.raw > bench_output.jsonl 2>&1
+          python ci/check_regression.py .bench_baseline.json bench_output.jsonl
