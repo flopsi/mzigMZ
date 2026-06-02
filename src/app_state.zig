@@ -2,7 +2,6 @@
 const std = @import("std");
 const advanced = @import("advanced_packet");
 const raw = @import("raw_file");
-const chromatogram = @import("chromatogram");
 const scan_event = @import("scan_event");
 const trailer_events = @import("trailer_events");
 const profile = @import("profile_packet");
@@ -30,6 +29,21 @@ fn fileTimeToIso8601(allocator: std.mem.Allocator, filetime: u64) !?[]u8 {
         day_secs.getSecondsIntoMinute(),
     });
 }
+
+/// Chromatogram data extracted from scan indices (no packet decode needed).
+/// Contains all scans; filtering by MS level happens at render time.
+pub const Chromatogram = struct {
+    rt: []f64, // retention time in minutes
+    intensity: []f64, // TIC or base peak intensity
+    ms_level: []u8, // 1=MS1, 2=MS2, etc.
+    num_points: usize,
+
+    pub fn deinit(self: Chromatogram, allocator: std.mem.Allocator) void {
+        allocator.free(self.rt);
+        allocator.free(self.intensity);
+        allocator.free(self.ms_level);
+    }
+};
 
 pub const ViewMode = enum {
     stick,
@@ -171,8 +185,8 @@ pub const AppState = struct {
     filtered_indices: ?[]usize,
 
     // Chromatograms (computed at file open)
-    tic_chromatogram: ?chromatogram.Chromatogram,
-    bpc_chromatogram: ?chromatogram.Chromatogram,
+    tic_chromatogram: ?Chromatogram,
+    bpc_chromatogram: ?Chromatogram,
     chromatogram_ms_level_filter: ?u8,
 
     // Trailer scan events (parsed at file open)
@@ -1392,20 +1406,46 @@ pub const AppState = struct {
             self.bpc_chromatogram = null;
         }
 
-        // Build ScanMeta array
-        const scan_meta = self.allocator.alloc(chromatogram.ScanMeta, self.scans.len) catch return;
-        defer self.allocator.free(scan_meta);
-        for (self.scans, 0..) |scan, i| {
-            scan_meta[i] = .{
-                .rt = scan.rt,
-                .tic = scan.tic,
-                .base_peak_intensity = scan.base_peak_intensity,
-                .ms_level = scan.ms_level,
-            };
-        }
+        const n = self.scans.len;
+        const allocator = self.allocator;
 
-        self.tic_chromatogram = chromatogram.extractTIC(self.allocator, scan_meta) catch null;
-        self.bpc_chromatogram = chromatogram.extractBPC(self.allocator, scan_meta) catch null;
+        // TIC: rt + tic + ms_level
+        const tic_rt = allocator.alloc(f64, n) catch return;
+        errdefer allocator.free(tic_rt);
+        const tic_intensity = allocator.alloc(f64, n) catch return;
+        errdefer allocator.free(tic_intensity);
+        const tic_ms_level = allocator.alloc(u8, n) catch return;
+        errdefer allocator.free(tic_ms_level);
+        for (self.scans, 0..) |scan, i| {
+            tic_rt[i] = scan.rt;
+            tic_intensity[i] = scan.tic;
+            tic_ms_level[i] = scan.ms_level;
+        }
+        self.tic_chromatogram = .{
+            .rt = tic_rt,
+            .intensity = tic_intensity,
+            .ms_level = tic_ms_level,
+            .num_points = n,
+        };
+
+        // BPC: rt + base_peak_intensity + ms_level
+        const bpc_rt = allocator.alloc(f64, n) catch return;
+        errdefer allocator.free(bpc_rt);
+        const bpc_intensity = allocator.alloc(f64, n) catch return;
+        errdefer allocator.free(bpc_intensity);
+        const bpc_ms_level = allocator.alloc(u8, n) catch return;
+        errdefer allocator.free(bpc_ms_level);
+        for (self.scans, 0..) |scan, i| {
+            bpc_rt[i] = scan.rt;
+            bpc_intensity[i] = scan.base_peak_intensity;
+            bpc_ms_level[i] = scan.ms_level;
+        }
+        self.bpc_chromatogram = .{
+            .rt = bpc_rt,
+            .intensity = bpc_intensity,
+            .ms_level = bpc_ms_level,
+            .num_points = n,
+        };
     }
 
     pub fn setChromatogramMsLevelFilter(self: *AppState, level: ?u8) void {

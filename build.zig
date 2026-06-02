@@ -28,13 +28,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    // ---- raw_core/chromatogram module -------------------------------------
-    const chromatogram_mod = b.createModule(.{
-        .root_source_file = b.path("src/raw_core/chromatogram.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
     // ---- raw_core/scan_event module ---------------------------------------
     const scan_event_mod = b.createModule(.{
         .root_source_file = b.path("src/raw_core/scan_event.zig"),
@@ -60,7 +53,6 @@ pub fn build(b: *std.Build) void {
     });
     app_state_mod.addImport("advanced_packet", packet_mod);
     app_state_mod.addImport("raw_file", raw_file_mod);
-    app_state_mod.addImport("chromatogram", chromatogram_mod);
     app_state_mod.addImport("scan_event", scan_event_mod);
     app_state_mod.addImport("trailer_events", trailer_events_mod);
     app_state_mod.addImport("profile_packet", profile_mod);
@@ -90,7 +82,6 @@ pub fn build(b: *std.Build) void {
     });
     chromatogram_canvas_mod.addImport("win32_common", win32_common_mod);
     chromatogram_canvas_mod.addImport("app_state", app_state_mod);
-    chromatogram_canvas_mod.addImport("chromatogram", chromatogram_mod);
 
     // ---- gui/scan_list module ---------------------------------------------
     const scan_list_mod = b.createModule(.{

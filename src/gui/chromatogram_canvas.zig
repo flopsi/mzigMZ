@@ -1,7 +1,6 @@
 const std = @import("std");
 const w32 = @import("win32_common");
 const app = @import("app_state");
-const chromatogram = @import("chromatogram");
 
 pub const ChromatogramType = enum {
     tic,
@@ -294,7 +293,7 @@ fn niceRound(val: f64) f64 {
     return nice * mag;
 }
 
-fn resetZoom(cg: *const chromatogram.Chromatogram, ms_filter: ?u8) void {
+fn resetZoom(cg: *const app.Chromatogram, ms_filter: ?u8) void {
     g_zoom_active = false;
     // Compute full range for reset
     g_zoom_rt_min = std.math.inf(f64);
