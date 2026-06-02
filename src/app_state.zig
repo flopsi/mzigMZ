@@ -499,7 +499,7 @@ pub const AppState = struct {
         const mm = self.raw_file.?.mm;
 
         for (self.scans) |*scan| {
-            const trailer = raw.readScanTrailer(self.allocator, mm, scan.trailer_offset) catch |err| {
+            const trailer = trailer_events.readScanTrailer(self.allocator, mm, scan.trailer_offset) catch |err| {
                 std.log.warn("Failed to read scan trailer for scan {d}: {s}", .{ scan.scan_number, @errorName(err) });
                 continue;
             };

@@ -228,6 +228,27 @@ pub fn build(b: *std.Build) void {
         test_trailer_run.addArgs(args);
     }
 
+    // ---- C3 trailer-label sanity test -----------------------------------------
+    const test_trailer_label_mod = b.createModule(.{
+        .root_source_file = b.path("src/test_trailer_label.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_trailer_label_mod.addImport("app_state", app_state_mod);
+    test_trailer_label_mod.addImport("raw_file_reader", raw_file_reader_mod);
+
+    const test_trailer_label_exe = b.addExecutable(.{
+        .name = "test-trailer-label",
+        .root_module = test_trailer_label_mod,
+    });
+    b.installArtifact(test_trailer_label_exe);
+
+    const test_trailer_label_run = b.addRunArtifact(test_trailer_label_exe);
+    test_trailer_label_run.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        test_trailer_label_run.addArgs(args);
+    }
+
     const test_trailer_step = b.step("test-trailer", "Run Phase 1 trailer test (pass .raw file as arg)");
     test_trailer_step.dependOn(&test_trailer_run.step);
 

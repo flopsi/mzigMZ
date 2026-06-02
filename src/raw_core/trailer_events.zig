@@ -179,3 +179,155 @@ pub fn parseTrailerScanEvents(
         .scan_to_unique = scan_to_unique,
     };
 }
+
+// =============================================================================
+// Per-scan trailer record (label table). Each Thermo RAW scan has a small
+// structured record keyed by integer labels: label 9 is the filter string,
+// label 18 is the charge state, etc. This is the legacy / fallback path
+// for the trailer-events table (TrailerScanEvents above), and is also used
+// by callers that only need a single scan's filter string and charge.
+// =============================================================================
+
+/// Per-scan trailer record extracted from the on-disk label table.
+pub const ScanTrailer = struct {
+    filter_string: ?[]u8, // allocator-owned UTF-8, null if not available
+    ms_level: u8, // 1=MS1, 2=MS2, etc.
+    charge_state: i32, // 0 = unknown
+    precursor_mz: f64, // 0 = none
+};
+
+/// Case-insensitive substring search. Returns the byte offset of the first
+/// match, or null if `needle` does not occur in `haystack`.
+fn indexOfIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
+    if (needle.len > haystack.len) return null;
+    var i: usize = 0;
+    while (i <= haystack.len - needle.len) : (i += 1) {
+        var j: usize = 0;
+        while (j < needle.len) : (j += 1) {
+            if (std.ascii.toLower(haystack[i + j]) != needle[j]) break;
+        } else return i;
+    }
+    return null;
+}
+
+/// Parse MS level from a Thermo filter string.
+/// Examples: "FTMS + p NSI Full ms [350.0000-1800.0000]" → MS1
+///           "FTMS + p NSI d Full ms2 712.35@hcd30.00 [110.0000-2000.0000]" → MS2
+///           "ITMS + c NSI r d sa Full ms2 445.12@cid35.00 [50.00-910.00]" → MS2
+pub fn parseMsLevelFromFilter(filter: []const u8) u8 {
+    // Look for "ms2" or "ms3" first (must check before "ms " to avoid false match)
+    if (indexOfIgnoreCase(filter, "ms3") != null) return 3;
+    if (indexOfIgnoreCase(filter, "ms2") != null) return 2;
+    // MS1 patterns: "Full ms [", "Full ms2" would have been caught above
+    // Look for " ms " or " ms[" as MS1 indicator
+    if (indexOfIgnoreCase(filter, " ms ") != null) return 1;
+    if (indexOfIgnoreCase(filter, " ms[") != null) return 1;
+    // Default: if it has "ms" anywhere, assume MS1
+    if (indexOfIgnoreCase(filter, "ms") != null) return 1;
+    return 1; // default to MS1
+}
+
+/// Parse charge state from filter string.
+/// Looks for pattern like "712.35@hcd30.00" — charge is usually in trailer, not filter.
+/// For now, return 0 (unknown) — charge is better extracted from centroid feature words.
+pub fn parseChargeFromFilter(filter: []const u8) i32 {
+    _ = filter;
+    return 0;
+}
+
+/// Parse precursor m/z from filter string.
+/// Looks for number before "@" symbol in MS2 filters.
+pub fn parsePrecursorMzFromFilter(filter: []const u8) f64 {
+    const at_pos = std.mem.indexOf(u8, filter, "@");
+    if (at_pos == null) return 0;
+    // Find the start of the number before @
+    var start = at_pos.?;
+    while (start > 0 and filter[start - 1] == ' ') start -= 1;
+    var num_start = start;
+    while (num_start > 0 and (std.ascii.isDigit(filter[num_start - 1]) or filter[num_start - 1] == '.')) {
+        num_start -= 1;
+    }
+    if (num_start >= start) return 0;
+    const num_str = filter[num_start..start];
+    return std.fmt.parseFloat(f64, num_str) catch 0;
+}
+
+/// Read the per-scan trailer record from the memory-mapped file.
+/// `trailer_offset` is the byte offset of the trailer record in the file.
+/// This is the legacy / fallback path; the authoritative metadata lives
+/// in the TrailerScanEvents table (see parseTrailerScanEvents above).
+pub fn readScanTrailer(
+    allocator: std.mem.Allocator,
+    mm: std.Io.File.MemoryMap,
+    trailer_offset: i32,
+) raw.RawResolveError!ScanTrailer {
+    if (trailer_offset <= 0) {
+        return .{ .filter_string = null, .ms_level = 1, .charge_state = 0, .precursor_mz = 0 };
+    }
+    const off: usize = @intCast(trailer_offset);
+    if (off + 8 > mm.memory.len) return raw.RawResolveError.Truncated;
+
+    // Trailer format: i32 count, then count pairs of (i32 label, value)
+    // Label 9 = filter string (wide string)
+    const num_entries = std.mem.readInt(i32, mm.memory[off..][0..4], .little);
+    if (num_entries < 0 or num_entries > 1000) return raw.RawResolveError.InvalidRawFileInfo;
+
+    var filter_str: ?[]u8 = null;
+    var ms_level: u8 = 1;
+    var charge: i32 = 0;
+    var precursor: f64 = 0;
+
+    var pos: usize = off + 4;
+    var i: i32 = 0;
+    while (i < num_entries) : (i += 1) {
+        if (pos + 8 > mm.memory.len) break;
+        const label = std.mem.readInt(i32, mm.memory[pos..][0..4], .little);
+        const value = std.mem.readInt(i32, mm.memory[pos + 4 ..][0..4], .little);
+        pos += 8;
+
+        switch (label) {
+            9 => { // Filter string
+                if (value > 0 and value < raw.MAX_STRING_CHARS) {
+                    const str_len: usize = @intCast(value);
+                    if (pos + str_len * 2 <= mm.memory.len) {
+                        const wide_slice = mm.memory[pos .. pos + str_len * 2];
+
+                        // Fast path: small strings on stack
+                        const stack_chars = 256;
+                        if (str_len <= stack_chars) {
+                            var stack_wide: [stack_chars]u16 = undefined;
+                            @memcpy(std.mem.sliceAsBytes(stack_wide[0..str_len]), wide_slice);
+                            var stack_utf8: [stack_chars * 3]u8 = undefined;
+                            const utf8_len = std.unicode.utf16LeToUtf8(&stack_utf8, stack_wide[0..str_len]) catch continue;
+                            const utf8_buf = allocator.alloc(u8, utf8_len) catch continue;
+                            @memcpy(utf8_buf, stack_utf8[0..utf8_len]);
+                            filter_str = utf8_buf;
+                            ms_level = parseMsLevelFromFilter(utf8_buf);
+                            precursor = parsePrecursorMzFromFilter(utf8_buf);
+                        } else {
+                            const wide_u16 = allocator.alloc(u16, str_len) catch continue;
+                            defer allocator.free(wide_u16);
+                            @memcpy(std.mem.sliceAsBytes(wide_u16), wide_slice);
+                            const utf8_buf = std.unicode.utf16LeToUtf8Alloc(allocator, wide_u16) catch continue;
+                            filter_str = utf8_buf;
+                            ms_level = parseMsLevelFromFilter(utf8_buf);
+                            precursor = parsePrecursorMzFromFilter(utf8_buf);
+                        }
+                    }
+                    pos += str_len * 2;
+                }
+            },
+            18 => { // Charge state
+                if (value > 0 and value < 20) charge = value;
+            },
+            else => {},
+        }
+    }
+
+    return .{
+        .filter_string = filter_str,
+        .ms_level = ms_level,
+        .charge_state = charge,
+        .precursor_mz = precursor,
+    };
+}
