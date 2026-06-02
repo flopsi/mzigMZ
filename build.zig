@@ -53,6 +53,17 @@ pub fn build(b: *std.Build) void {
     trailer_events_mod.addImport("raw_file", raw_file_mod);
     trailer_events_mod.addImport("scan_event", scan_event_mod);
 
+    // ---- scan_decoder module -----------------------------------------
+    const scan_decoder_mod = b.createModule( .{
+        .root_source_file = b.path("src/scan_decoder.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    scan_decoder_mod.addImport("advanced_packet", packet_mod);
+    scan_decoder_mod.addImport("raw_file", raw_file_mod);
+    scan_decoder_mod.addImport("profile_packet", profile_mod);
+    scan_decoder_mod.addImport("trailer_events", trailer_events_mod);
+
     // ---- app_state module -------------------------------------------------
     const app_state_mod = b.createModule(.{
         .root_source_file = b.path("src/app_state.zig"),
@@ -65,6 +76,7 @@ pub fn build(b: *std.Build) void {
     app_state_mod.addImport("scan_event", scan_event_mod);
     app_state_mod.addImport("trailer_events", trailer_events_mod);
     app_state_mod.addImport("profile_packet", profile_mod);
+    app_state_mod.addImport("scan_decoder", scan_decoder_mod);
 
     // ---- gui/win32_common module ------------------------------------------
     const win32_common_mod = b.createModule(.{

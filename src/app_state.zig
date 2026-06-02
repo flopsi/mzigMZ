@@ -6,57 +6,7 @@ const raw_file_reader = @import("raw_file_reader");
 const scan_event = @import("scan_event");
 const trailer_events = @import("trailer_events");
 const profile = @import("profile_packet");
-
-/// Convert Windows FILETIME (100ns intervals since 1601-01-01 UTC) to ISO 8601 string.
-fn fileTimeToIso8601(allocator: std.mem.Allocator, filetime: u64) !?[]u8 {
-    if (filetime == 0) return null;
-    const windows_epoch_offset: i128 = 116444736000000000;
-    const hundred_ns_per_sec: i128 = 10000000;
-    const unix_ts = @divFloor(@as(i128, filetime) - windows_epoch_offset, hundred_ns_per_sec);
-    if (unix_ts < 0) return null;
-
-    const es = std.time.epoch.EpochSeconds{ .secs = @intCast(unix_ts) };
-    const yd = es.getEpochDay();
-    const year_day = yd.calculateYearDay();
-    const month_day = year_day.calculateMonthDay();
-    const day_secs = es.getDaySeconds();
-
-    return try std.fmt.allocPrint(allocator, "{d:0>4}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z", .{
-        year_day.year,
-        month_day.month.numeric(),
-        month_day.day_index + 1,
-        day_secs.getHoursIntoDay(),
-        day_secs.getMinutesIntoHour(),
-        day_secs.getSecondsIntoMinute(),
-    });
-}
-
-/// Chromatogram data extracted from scan indices (no packet decode needed).
-/// Contains all scans; filtering by MS level happens at render time.
-pub const Chromatogram = struct {
-    rt: []f64, // retention time in minutes
-    intensity: []f64, // TIC or base peak intensity
-    ms_level: []u8, // 1=MS1, 2=MS2, etc.
-    num_points: usize,
-
-    pub fn deinit(self: Chromatogram, allocator: std.mem.Allocator) void {
-        allocator.free(self.rt);
-        allocator.free(self.intensity);
-        allocator.free(self.ms_level);
-    }
-};
-
-pub const ViewMode = enum {
-    stick,
-    line,
-};
-
-const SPECTRUM_CACHE_SIZE = 8;
-
-const CachedSpectrum = struct {
-    scan_index: usize,
-    spectrum: advanced.Spectrum,
-};
+const scan_decoder = @import("scan_decoder");
 
 pub const ZoomState = struct {
     mz_min: f64,
@@ -101,6 +51,26 @@ pub const ZoomState = struct {
     pub fn panBy(self: *ZoomState, delta_mz: f64) void {
         self.mz_min += delta_mz;
         self.mz_max += delta_mz;
+    }
+};
+
+pub const ViewMode = enum {
+    stick,
+    line,
+};
+
+/// Chromatogram data extracted from scan indices (no packet decode needed).
+/// Contains all scans; filtering by MS level happens at render time.
+pub const Chromatogram = struct {
+    rt: []f64, // retention time in minutes
+    intensity: []f64, // TIC or base peak intensity
+    ms_level: []u8, // 1=MS1, 2=MS2, etc.
+    num_points: usize,
+
+    pub fn deinit(self: Chromatogram, allocator: std.mem.Allocator) void {
+        allocator.free(self.rt);
+        allocator.free(self.intensity);
+        allocator.free(self.ms_level);
     }
 };
 
@@ -166,10 +136,6 @@ pub const AppState = struct {
     reuse_widths: ?[]f32,              // temp buffer for resolution widths
     reuse_noise: ?[]advanced.NoiseInfoPacket, // temp buffer for noise info packets
 
-    // Spectrum cache for recently viewed scans (avoids re-decode on navigation)
-    spectrum_cache: [SPECTRUM_CACHE_SIZE]?CachedSpectrum,
-    spectrum_cache_next: usize,
-
     // MS level filter for scan list
     filter_ms_level: ?u8,
 
@@ -189,6 +155,11 @@ pub const AppState = struct {
     instrument_serial: ?[]u8,
     software_version: ?[]u8,
     creation_time: ?[]u8, // ISO 8601 datetime from RAW file header FILETIME
+
+    // Scan decoder — owns the decode pipeline and spectrum cache.
+    // Extracted from the four loadScan* methods (C1 refactor). Keeps
+    // packet-header read, decode dispatch, and SIMD min/max in one place.
+    decoder: scan_decoder.ScanDecoder,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io) AppState {
         return .{
@@ -212,8 +183,6 @@ pub const AppState = struct {
             .reuse_features = null,
             .reuse_widths = null,
             .reuse_noise = null,
-            .spectrum_cache = .{null} ** SPECTRUM_CACHE_SIZE,
-            .spectrum_cache_next = 0,
             .filter_ms_level = null,
             .filtered_indices = null,
             .tic_chromatogram = null,
@@ -224,6 +193,7 @@ pub const AppState = struct {
             .instrument_serial = null,
             .software_version = null,
             .creation_time = null,
+            .decoder = scan_decoder.ScanDecoder.init(allocator),
         };
     }
 
@@ -290,15 +260,10 @@ pub const AppState = struct {
         }
         // Free current_spectrum only if it's not owned by the cache
         if (self.current_spectrum) |*spec| {
-            if (!self.isSpectrumCached(spec.*)) spec.deinit(self.allocator);
+            if (!self.decoder.isCached(spec.*)) spec.deinit(self.allocator);
         }
-        // Free all cached spectra
-        for (&self.spectrum_cache) |*entry_opt| {
-            if (entry_opt.*) |*entry| {
-                entry.spectrum.deinit(self.allocator);
-                entry_opt.* = null;
-            }
-        }
+        // Free all cached spectra via decoder
+        self.decoder.freeCache();
         if (self.raw_file) |*rf| {
             rf.deinit();
             self.raw_file = null;
@@ -403,15 +368,36 @@ pub const AppState = struct {
         self.scans = scans;
         self.raw_file = rf;
 
+        // Configure scan decoder with RawFile state
+        self.decoder.configure(
+            rf.mm,
+            rf.packet_pos,
+            rf.file_size,
+            self.trailer_events,
+        );
+        self.decoder.setReuseBuffers(
+            self.reuse_mz,
+            self.reuse_intensity,
+            self.reuse_freq,
+            self.reuse_features,
+            self.reuse_widths,
+            self.reuse_noise,
+        );
+
         // Parse TrailerScanEvents to get authoritative MS level and precursor metadata.
         // trailer_offset in ScanIndexEntry is an INDEX into the scan_to_unique array.
         try self.parseScanTrailersAtOpen();
 
+        // Re-configure decoder with the trailer events now that they are parsed.
+        self.decoder.configure(
+            rf.mm,
+            rf.packet_pos,
+            rf.file_size,
+            self.trailer_events,
+        );
+
         // Default to MS1 filter for cleaner initial view
         self.filter_ms_level = 1;
-
-        // Preload first 10 scans into cache for instant navigation
-        self.preloadCache();
 
         // NOTE: Chromatograms are computed on-demand to keep
         // file open fast and responsive. For benchmark mode, call
@@ -528,49 +514,17 @@ pub const AppState = struct {
 
     /// Return true if the given spectrum's memory is owned by the cache.
     fn isSpectrumCached(self: *AppState, spectrum: advanced.Spectrum) bool {
-        for (self.spectrum_cache) |entry_opt| {
-            if (entry_opt) |entry| {
-                if (entry.spectrum.mz.ptr == spectrum.mz.ptr) return true;
-            }
-        }
-        return false;
+        return self.decoder.isCached(spectrum);
     }
 
     /// Deep-copy a spectrum into the cache (round-robin eviction).
     fn cacheSpectrum(self: *AppState, scan_index: usize, spectrum: advanced.Spectrum) !void {
-        const slot = self.spectrum_cache_next;
-        self.spectrum_cache_next = (self.spectrum_cache_next + 1) % SPECTRUM_CACHE_SIZE;
-
-        // Evict old entry
-        if (self.spectrum_cache[slot]) |*old| {
-            old.spectrum.deinit(self.allocator);
-        }
-
-        const mz = try self.allocator.dupe(f64, spectrum.mz);
-        const intensity = try self.allocator.dupe(f32, spectrum.intensity);
-        const ranges = try self.allocator.dupe(advanced.MassRange, spectrum.ranges);
-        const features: ?[]advanced.PeakFeatures = if (spectrum.features) |f|
-            try self.allocator.dupe(advanced.PeakFeatures, f)
-        else
-            null;
-
-        self.spectrum_cache[slot] = .{
-            .scan_index = scan_index,
-            .spectrum = .{
-                .mz = mz,
-                .intensity = intensity,
-                .ranges = ranges,
-                .features = features,
-                .mz_min = spectrum.mz_min,
-                .mz_max = spectrum.mz_max,
-                .intensity_max = spectrum.intensity_max,
-            },
-        };
+        try self.decoder.cacheSpectrum(scan_index, spectrum);
     }
 
     /// Preload the first N scans into the cache.
     pub fn preloadCache(self: *AppState) void {
-        const n = @min(SPECTRUM_CACHE_SIZE, self.scans.len);
+        const n = @min(scan_decoder.SPECTRUM_CACHE_SIZE, self.scans.len);
         for (0..n) |i| {
             self.loadScan(i) catch continue;
         }
@@ -582,9 +536,6 @@ pub const AppState = struct {
         // TrailerScanEvents are parsed at file open. MS level and precursor
         // metadata are already authoritative in self.scans[scan_index].
 
-        const mm = self.raw_file.?.mm;
-        const packet_pos = self.raw_file.?.packet_pos;
-        const file_size = self.raw_file.?.file_size;
         const scan = self.scans[scan_index];
 
         // Check packet type — we support FT centroid and FT profile packets
@@ -611,26 +562,21 @@ pub const AppState = struct {
             return;
         }
 
-        // Check cache first
-        for (self.spectrum_cache) |entry_opt| {
-            if (entry_opt) |entry| {
-                if (entry.scan_index == scan_index) {
-                    // Free old spectrum only if it's not cached
-                    if (self.current_spectrum) |*spec| {
-                        if (!self.isSpectrumCached(spec.*)) spec.deinit(self.allocator);
-                    }
-                    self.current_spectrum = entry.spectrum; // shallow copy
-                    self.current_scan_index = scan_index;
-                    self.zoom = .{
-                        .mz_min = entry.spectrum.mz_min,
-                        .mz_max = entry.spectrum.mz_max,
-                        .inten_min = 0,
-                        .inten_max = entry.spectrum.intensity_max,
-                    };
-                    self.scans[scan_index].peak_count = entry.spectrum.pointCount();
-                    return;
-                }
+        // Check cache first (ScanDecoder manages the LRU cache)
+        if (self.decoder.getCached(scan_index)) |cached| {
+            if (self.current_spectrum) |*spec| {
+                if (!self.isSpectrumCached(spec.*)) spec.deinit(self.allocator);
             }
+            self.current_spectrum = cached; // shallow copy
+            self.current_scan_index = scan_index;
+            self.zoom = .{
+                .mz_min = cached.mz_min,
+                .mz_max = cached.mz_max,
+                .inten_min = 0,
+                .inten_max = cached.intensity_max,
+            };
+            self.scans[scan_index].peak_count = cached.pointCount();
+            return;
         }
 
         // Free old spectrum (only if not cached)
@@ -639,17 +585,43 @@ pub const AppState = struct {
             self.current_spectrum = null;
         }
 
-        const packet_offset = packet_pos + scan.data_offset;
-        if (packet_offset >= file_size) {
-            return error.OffsetBeyondFile;
+        // Decode into owned buffers via ScanDecoder
+        const result = try self.decoder.decode(
+            scan_index,
+            &.{ .packet_type = scan.packet_type, .data_offset = scan.data_offset },
+            .owned,
+        );
+        const num_points = result.num_points;
+
+        // Copy into owned arrays for the Spectrum struct
+        const mz = try self.allocator.alloc(f64, num_points);
+        errdefer self.allocator.free(mz);
+        const intensity = try self.allocator.alloc(f32, num_points);
+        errdefer self.allocator.free(intensity);
+        @memcpy(mz, result.mz);
+        @memcpy(intensity, result.intensity);
+
+        // Copy features if present (centroid data)
+        var features_opt: ?[]advanced.PeakFeatures = null;
+        if (result.features_opt) |feat| {
+            const f = try self.allocator.alloc(advanced.PeakFeatures, num_points);
+            errdefer self.allocator.free(f);
+            @memcpy(f, feat);
+            features_opt = f;
         }
 
-        // Read packet header to compute exact size
-        const header_size = 32;
-        if (packet_offset + header_size > file_size) {
-            return error.Truncated;
-        }
-        const header_bytes = mm.memory[packet_offset..packet_offset + header_size];
+        const mz_min = result.mz_min;
+        const mz_max = result.mz_max;
+        const intensity_max = result.intensity_max;
+
+        // ------------------------------------------------------------------
+        // Label Peak Data Parsing (resolution, noise, baseline)
+        // ------------------------------------------------------------------
+        // Only available from centroid packets; needs parse_peak_metadata flag.
+        // We need the packet header (h) to know if expansion/noise words exist.
+        // Re-decode the packet header — this is just 32 bytes, cheap.
+        const packet_offset = self.raw_file.?.packet_pos + scan.data_offset;
+        const header_bytes = self.raw_file.?.mm.memory[packet_offset..packet_offset + 32];
         const h = advanced.PacketHeader{
             .num_segments = std.mem.readInt(u32, header_bytes[0..4], .little),
             .num_profile_words = std.mem.readInt(u32, header_bytes[4..8], .little),
@@ -661,101 +633,16 @@ pub const AppState = struct {
             .num_debug_info_words = std.mem.readInt(u32, header_bytes[28..32], .little),
         };
         const packet_size = advanced.packetSizeFromHeader(h);
+        const actual_size: usize = @intCast(@min(packet_size, self.raw_file.?.file_size - packet_offset));
+        if (actual_size == 0) return error.Truncated;
+        const packet_slice = self.raw_file.?.mm.memory[packet_offset..packet_offset + actual_size];
 
-        const actual_size: usize = @intCast(@min(packet_size, file_size - packet_offset));
-        if (actual_size == 0) {
-            return error.Truncated;
-        }
-
-        const packet_slice = mm.memory[packet_offset..packet_offset + actual_size];
-
-        // Determine packet type and whether to decode full profile or centroids
-        const is_profile = packet_type == raw.PACKET_TYPE_FT_PROFILE;
-        const has_centroid_data = h.num_centroid_words > 0;
-
-        // For FT_PROFILE packets, decode embedded centroids when available;
-        // fall back to full profile trace only when no centroids are present.
-        const decode_profile = is_profile and !has_centroid_data;
-
-        // features are only needed when decoding centroid data
-        const needs_features = !decode_profile;
-
-        // Estimate output size based on decode path
-        const est_points: usize = if (decode_profile) blk: {
-            // Profile packets can have multiple segments. The total output points
-            // is the sum of all segments' num_expanded_words. Parse all segment
-            // headers to compute the exact total. See UNSKILLED.md.
-            const segment_data_start = 32 + @as(usize, h.num_segments) * 8;
-            var seg_pos = segment_data_start;
-            var total_expanded: usize = 0;
-            var seg: u32 = 0;
-            while (seg < h.num_segments) : (seg += 1) {
-                if (packet_slice.len >= seg_pos + 24) {
-                    const num_expanded = std.mem.readInt(u32, packet_slice[seg_pos + 20 ..][0..4], .little);
-                    total_expanded += num_expanded;
-                }
-                seg_pos += 24; // each segment header is 24 bytes
-            }
-
-            break :blk @intCast(@max(64, total_expanded));
-        } else blk: {
-            const accurate = h.accurateMassCentroids();
-            const entry_size: u64 = if (accurate) 12 else 8;
-            break :blk @intCast(@max(64, h.num_centroid_words * 4 / entry_size));
-        };
-
-        // Grow reusable buffers if needed
-        if (self.reuse_mz == null or self.reuse_mz.?.len < est_points) {
-            if (self.reuse_mz) |old| self.allocator.free(old);
-            self.reuse_mz = try self.allocator.alloc(f64, est_points);
-        }
-        if (self.reuse_intensity == null or self.reuse_intensity.?.len < est_points) {
-            if (self.reuse_intensity) |old| self.allocator.free(old);
-            self.reuse_intensity = try self.allocator.alloc(f32, est_points);
-        }
-        if (needs_features) {
-            if (self.reuse_features == null or self.reuse_features.?.len < est_points) {
-                if (self.reuse_features) |old| self.allocator.free(old);
-                self.reuse_features = try self.allocator.alloc(advanced.PeakFeatures, est_points);
-            }
-        }
-
-        const num_points = if (decode_profile) blk: {
-            // Get calibrators from trailer event
-            var calibrators: []const f64 = &[_]f64{};
-            if (self.trailer_events) |te| {
-                if (te.getEvent(scan_index)) |evt| {
-                    calibrators = evt.mass_calibrators;
-                }
-            }
-
-            // Determine UseFtProfileSubSegment from header
-            const use_subsegment = (h.default_feature_word & 0x40) == 0
-                and (h.default_feature_word & 0x80) != 0;
-
-            break :blk try profile.decodeFtProfile(
-                packet_slice,
-                calibrators,
-                self.reuse_mz.?,
-                self.reuse_intensity.?,
-                use_subsegment,
-            );
-        } else try advanced.decodeSimplifiedCentroidsIntoBuffers(
-            packet_slice,
-            0,
-            self.reuse_mz.?,
-            self.reuse_intensity.?,
-            if (needs_features) self.reuse_features.? else null,
-        );
-
-        // ------------------------------------------------------------------
-        // Label Peak Data Parsing (resolution, noise, baseline)
-        // ------------------------------------------------------------------
-        // Lazily parse resolution widths and noise info only when requested.
+        const needs_features = h.num_centroid_words > 0;
         const has_label_data = self.parse_peak_metadata and needs_features and num_points > 0 and
             (h.num_expansion_words > 0 or h.num_noise_info_words > 0);
+
         if (has_label_data) {
-            // Parse resolution widths from expansion words
+            // Reuse the result's mz/intensity slices as source for label parse
             if (h.num_expansion_words > 0) {
                 const max_widths = h.num_expansion_words - 1;
                 if (self.reuse_widths == null or self.reuse_widths.?.len < max_widths) {
@@ -764,9 +651,8 @@ pub const AppState = struct {
                 }
                 if (self.reuse_widths) |wb| {
                     const n = advanced.readResolutionWidths(packet_slice, 0, wb) catch 0;
-                    // Apply resolution widths to features
                     if (n > 0) {
-                        if (self.reuse_features) |fb| {
+                        if (features_opt) |fb| {
                             const limit = @min(n, num_points);
                             for (0..limit) |pi| {
                                 fb[pi].resolution = wb[pi];
@@ -776,7 +662,6 @@ pub const AppState = struct {
                 }
             }
 
-            // Parse noise info packets and interpolate
             if (h.num_noise_info_words > 0) {
                 const max_noise = h.num_noise_info_words * 4 / @sizeOf(advanced.NoiseInfoPacket);
                 if (self.reuse_noise == null or self.reuse_noise.?.len < max_noise) {
@@ -786,96 +671,14 @@ pub const AppState = struct {
                 if (self.reuse_noise) |nb| {
                     const n = advanced.readNoiseInfoPackets(packet_slice, 0, nb) catch 0;
                     if (n > 0) {
-                        if (self.reuse_features) |fb| {
+                        if (features_opt) |fb| {
                             advanced.interpolateNoiseBaseline(
-                                self.reuse_mz.?[0..num_points],
-                                self.reuse_intensity.?[0..num_points],
-                                fb[0..num_points],
-                                nb[0..n],
+                                mz, intensity, fb, nb,
                             );
                         }
                     }
                 }
             }
-        }
-
-        // Copy exactly num_points into owned arrays for the Spectrum struct
-        const mz = try self.allocator.alloc(f64, num_points);
-        errdefer self.allocator.free(mz);
-        const intensity = try self.allocator.alloc(f32, num_points);
-        errdefer self.allocator.free(intensity);
-
-        @memcpy(mz, self.reuse_mz.?[0..num_points]);
-        @memcpy(intensity, self.reuse_intensity.?[0..num_points]);
-
-        // Copy features into owned array (centroid data only)
-        var features_opt: ?[]advanced.PeakFeatures = null;
-        if (needs_features) {
-            const f = try self.allocator.alloc(advanced.PeakFeatures, num_points);
-            errdefer self.allocator.free(f);
-            @memcpy(f, self.reuse_features.?[0..num_points]);
-            features_opt = f;
-        }
-
-        // Compute min/max using SIMD where possible
-        var mz_min: f64 = std.math.inf(f64);
-        var mz_max: f64 = -std.math.inf(f64);
-        var intensity_max: f32 = 0;
-
-        if (num_points >= 4) {
-            // SIMD reduction for mz min/max (process 4 f64 at a time)
-            const Vec4f64 = @Vector(4, f64);
-            var mz_min_vec: Vec4f64 = @splat(std.math.inf(f64));
-            var mz_max_vec: Vec4f64 = @splat(-std.math.inf(f64));
-
-            const simd_end = num_points - (num_points % 4);
-            var i: usize = 0;
-            while (i < simd_end) : (i += 4) {
-                const v = Vec4f64{ mz[i], mz[i + 1], mz[i + 2], mz[i + 3] };
-                mz_min_vec = @min(mz_min_vec, v);
-                mz_max_vec = @max(mz_max_vec, v);
-            }
-            mz_min = @reduce(.Min, mz_min_vec);
-            mz_max = @reduce(.Max, mz_max_vec);
-
-            // Handle tail elements
-            while (i < num_points) : (i += 1) {
-                const m = mz[i];
-                if (m < mz_min) mz_min = m;
-                if (m > mz_max) mz_max = m;
-            }
-
-            // SIMD reduction for intensity max (process 8 f32 at a time)
-            const Vec8f32 = @Vector(8, f32);
-            var inten_max_vec: Vec8f32 = @splat(0.0);
-
-            const simd_end_inten = num_points - (num_points % 8);
-            i = 0;
-            while (i < simd_end_inten) : (i += 8) {
-                const v = Vec8f32{ intensity[i], intensity[i + 1], intensity[i + 2], intensity[i + 3],
-                                   intensity[i + 4], intensity[i + 5], intensity[i + 6], intensity[i + 7] };
-                inten_max_vec = @max(inten_max_vec, v);
-            }
-            intensity_max = @reduce(.Max, inten_max_vec);
-
-            // Handle tail elements
-            while (i < num_points) : (i += 1) {
-                const inten = intensity[i];
-                if (inten > intensity_max) intensity_max = inten;
-            }
-        } else {
-            // Scalar fallback for small arrays
-            for (mz, intensity) |m, inten| {
-                if (m < mz_min) mz_min = m;
-                if (m > mz_max) mz_max = m;
-                if (inten > intensity_max) intensity_max = inten;
-            }
-        }
-
-        if (num_points == 0) {
-            mz_min = 0;
-            mz_max = 1;
-            intensity_max = 1;
         }
 
         const spectrum = advanced.Spectrum{
@@ -891,7 +694,6 @@ pub const AppState = struct {
         self.current_spectrum = spectrum;
         self.current_scan_index = scan_index;
         self.scans[scan_index].peak_count = num_points;
-        // Use the scan's method mass range for default x-axis view
         const zm_min = if (scan.low_mass > 0 and scan.low_mass < mz_min) scan.low_mass else mz_min;
         const zm_max = if (scan.high_mass > zm_min) scan.high_mass else mz_max;
         self.zoom = .{
@@ -980,89 +782,19 @@ pub const AppState = struct {
         if (scan_index >= self.scans.len) return error.ScanOutOfRange;
         if (self.raw_file == null) return error.NoFileOpen;
 
-        const mm = self.raw_file.?.mm;
-        const packet_pos = self.raw_file.?.packet_pos;
-        const file_size = self.raw_file.?.file_size;
         const scan = self.scans[scan_index];
+        const result = try self.decoder.decode(
+            scan_index,
+            &.{ .packet_type = scan.packet_type, .data_offset = scan.data_offset },
+            .owned,
+        );
+        const num_points = result.num_points;
 
-        const packet_offset = packet_pos + scan.data_offset;
-        if (packet_offset >= file_size) {
-            return error.OffsetBeyondFile;
-        }
-
-        const header_size = 32;
-        if (packet_offset + header_size > file_size) {
-            return error.Truncated;
-        }
-        const header_bytes = mm.memory[packet_offset..packet_offset + header_size];
-        const h = advanced.PacketHeader{
-            .num_segments = std.mem.readInt(u32, header_bytes[0..4], .little),
-            .num_profile_words = std.mem.readInt(u32, header_bytes[4..8], .little),
-            .num_centroid_words = std.mem.readInt(u32, header_bytes[8..12], .little),
-            .default_feature_word = std.mem.readInt(u32, header_bytes[12..16], .little),
-            .num_non_default_feature_words = std.mem.readInt(u32, header_bytes[16..20], .little),
-            .num_expansion_words = std.mem.readInt(u32, header_bytes[20..24], .little),
-            .num_noise_info_words = std.mem.readInt(u32, header_bytes[24..28], .little),
-            .num_debug_info_words = std.mem.readInt(u32, header_bytes[28..32], .little),
-        };
-        const packet_size = advanced.packetSizeFromHeader(h);
-        const actual_size: usize = @intCast(@min(packet_size, file_size - packet_offset));
-        if (actual_size == 0) return error.Truncated;
-
-        const packet_slice = mm.memory[packet_offset..packet_offset + actual_size];
-
-        // Determine packet type and estimate output size
-        const is_profile = scan.packet_type == raw.PACKET_TYPE_FT_PROFILE;
-        const est_peaks: usize = if (is_profile) blk: {
-            // Profile packets can have multiple segments. Sum all segments' num_expanded.
-            // See UNSKILLED.md: "DO NOT silently ignore profile buffer sizing bug"
-            const segment_data_start = 32 + @as(usize, h.num_segments) * 8;
-            var seg_pos = segment_data_start;
-            var total_expanded: usize = 0;
-            var seg: u32 = 0;
-            while (seg < h.num_segments) : (seg += 1) {
-                if (packet_slice.len >= seg_pos + 24) {
-                    const num_expanded = std.mem.readInt(u32, packet_slice[seg_pos + 20 ..][0..4], .little);
-                    total_expanded += num_expanded;
-                }
-                seg_pos += 24;
-            }
-            break :blk @intCast(@max(64, total_expanded));
-        } else blk: {
-            const accurate = h.accurateMassCentroids();
-            const entry_size: u64 = if (accurate) 12 else 8;
-            break :blk @intCast(@max(64, h.num_centroid_words * 4 / entry_size));
-        };
-
-        // Allocate decode buffers from arena (fast bump allocation)
-        const mz_buf = arena.allocator().alloc(f64, est_peaks) catch return error.OutOfMemory;
-        const intensity_buf = arena.allocator().alloc(f32, est_peaks) catch return error.OutOfMemory;
-
-        // For FT_PROFILE packets with embedded centroid data, decode centroids instead of profile
-        const has_centroid_data = h.num_centroid_words > 0;
-        const num_points = if (is_profile and !has_centroid_data) blk: {
-            var calibrators: []const f64 = &[_]f64{};
-            if (self.trailer_events) |te| {
-                if (te.getEvent(scan_index)) |evt| {
-                    calibrators = evt.mass_calibrators;
-                }
-            }
-            const use_subsegment = (h.default_feature_word & 0x40) == 0
-                and (h.default_feature_word & 0x80) != 0;
-            break :blk try profile.decodeFtProfile(
-                packet_slice, calibrators, mz_buf, intensity_buf, use_subsegment);
-        } else advanced.decodeSimplifiedCentroidsIntoBuffers(
-            packet_slice, 0, mz_buf, intensity_buf, null,
-        ) catch |err| switch (err) {
-            advanced.PacketError.OutOfMemory => return error.OutOfMemory,
-            else => return error.Truncated,
-        };
-
-        // Allocate final arrays from arena
+        // Copy into arena-allocated arrays (arena owns the copies on reset)
         const mz = arena.allocator().alloc(f64, num_points) catch return error.OutOfMemory;
         const intensity = arena.allocator().alloc(f32, num_points) catch return error.OutOfMemory;
-        @memcpy(mz, mz_buf[0..num_points]);
-        @memcpy(intensity, intensity_buf[0..num_points]);
+        @memcpy(mz, result.mz);
+        @memcpy(intensity, result.intensity);
 
         return num_points;
     }
@@ -1073,101 +805,24 @@ pub const AppState = struct {
         if (scan_index >= self.scans.len) return error.ScanOutOfRange;
         if (self.raw_file == null) return error.NoFileOpen;
 
-        const mm = self.raw_file.?.mm;
-        const packet_pos = self.raw_file.?.packet_pos;
-        const file_size = self.raw_file.?.file_size;
         const scan = self.scans[scan_index];
 
-        const packet_offset = packet_pos + scan.data_offset;
-        if (packet_offset >= file_size) {
-            return error.OffsetBeyondFile;
-        }
-
-        const header_size = 32;
-        if (packet_offset + header_size > file_size) {
-            return error.Truncated;
-        }
-        const header_bytes = mm.memory[packet_offset..packet_offset + header_size];
-        const h = advanced.PacketHeader{
-            .num_segments = std.mem.readInt(u32, header_bytes[0..4], .little),
-            .num_profile_words = std.mem.readInt(u32, header_bytes[4..8], .little),
-            .num_centroid_words = std.mem.readInt(u32, header_bytes[8..12], .little),
-            .default_feature_word = std.mem.readInt(u32, header_bytes[12..16], .little),
-            .num_non_default_feature_words = std.mem.readInt(u32, header_bytes[16..20], .little),
-            .num_expansion_words = std.mem.readInt(u32, header_bytes[20..24], .little),
-            .num_noise_info_words = std.mem.readInt(u32, header_bytes[24..28], .little),
-            .num_debug_info_words = std.mem.readInt(u32, header_bytes[28..32], .little),
-        };
-        const packet_size = advanced.packetSizeFromHeader(h);
-        const actual_size: usize = @intCast(@min(packet_size, file_size - packet_offset));
-        if (actual_size == 0) return error.Truncated;
-
-        const packet_slice = mm.memory[packet_offset..packet_offset + actual_size];
-
-        // Determine packet type and estimate output size
-        const is_profile = scan.packet_type == raw.PACKET_TYPE_FT_PROFILE;
-        const est_peaks: usize = if (is_profile) blk: {
-            // Profile packets can have multiple segments. Sum all segments' num_expanded.
-            // See UNSKILLED.md: "DO NOT silently ignore profile buffer sizing bug"
-            const segment_data_start = 32 + @as(usize, h.num_segments) * 8;
-            var seg_pos = segment_data_start;
-            var total_expanded: usize = 0;
-            var seg: u32 = 0;
-            while (seg < h.num_segments) : (seg += 1) {
-                if (packet_slice.len >= seg_pos + 24) {
-                    const num_expanded = std.mem.readInt(u32, packet_slice[seg_pos + 20 ..][0..4], .little);
-                    total_expanded += num_expanded;
-                }
-                seg_pos += 24;
-            }
-            break :blk @intCast(@max(64, total_expanded));
-        } else blk: {
-            const accurate = h.accurateMassCentroids();
-            const entry_size: u64 = if (accurate) 12 else 8;
-            break :blk @intCast(@max(64, h.num_centroid_words * 4 / entry_size));
-        };
-
-        // Grow reusable buffers if needed (amortized — rarely reallocates)
-        if (self.reuse_mz == null or self.reuse_mz.?.len < est_peaks) {
-            if (self.reuse_mz) |old| self.allocator.free(old);
-            self.reuse_mz = self.allocator.alloc(f64, est_peaks) catch return error.OutOfMemory;
-        }
-        if (self.reuse_intensity == null or self.reuse_intensity.?.len < est_peaks) {
-            if (self.reuse_intensity) |old| self.allocator.free(old);
-            self.reuse_intensity = self.allocator.alloc(f32, est_peaks) catch return error.OutOfMemory;
-        }
-
-        // Prefetch next scan's data if available (overlaps memory fetch with decode)
+        // Prefetch next scan's data (overlaps memory fetch with decode)
         if (scan_index + 1 < self.scans.len) {
             const next_scan = self.scans[scan_index + 1];
-            const next_offset = packet_pos + next_scan.data_offset;
-            if (next_offset < file_size) {
-                @prefetch(mm.memory.ptr + next_offset, .{ .rw = .read, .cache = .data, .locality = 3 });
+            const next_offset = self.raw_file.?.packet_pos + next_scan.data_offset;
+            if (next_offset < self.raw_file.?.file_size) {
+                @prefetch(self.raw_file.?.mm.memory.ptr + next_offset, .{ .rw = .read, .cache = .data, .locality = 3 });
             }
         }
 
-        // For FT_PROFILE packets with embedded centroid data, decode centroids instead of profile
-        const has_centroid_data = h.num_centroid_words > 0;
-        const num_points = if (is_profile and !has_centroid_data) blk: {
-            var calibrators: []const f64 = &[_]f64{};
-            if (self.trailer_events) |te| {
-                if (te.getEvent(scan_index)) |evt| {
-                    calibrators = evt.mass_calibrators;
-                }
-            }
-            const use_subsegment = (h.default_feature_word & 0x40) == 0
-                and (h.default_feature_word & 0x80) != 0;
-            break :blk try profile.decodeFtProfile(
-                packet_slice, calibrators, self.reuse_mz.?, self.reuse_intensity.?, use_subsegment);
-        } else advanced.decodeSimplifiedCentroidsIntoBuffers(
-            packet_slice, 0, self.reuse_mz.?, self.reuse_intensity.?, null,
-        ) catch |err| switch (err) {
-            advanced.PacketError.OutOfMemory => return error.OutOfMemory,
-            else => return error.Truncated,
-        };
-
-        self.scans[scan_index].peak_count = num_points;
-        return num_points;
+        const result = try self.decoder.decode(
+            scan_index,
+            &.{ .packet_type = scan.packet_type, .data_offset = scan.data_offset },
+            .reuse_buffers,
+        );
+        self.scans[scan_index].peak_count = result.num_points;
+        return result.num_points;
     }
 
     /// Load scan data with raw frequencies preserved (for profile packets).
@@ -1176,94 +831,14 @@ pub const AppState = struct {
         if (scan_index >= self.scans.len) return error.ScanOutOfRange;
         if (self.raw_file == null) return error.NoFileOpen;
 
-        const mm = self.raw_file.?.mm;
-        const packet_pos = self.raw_file.?.packet_pos;
-        const file_size = self.raw_file.?.file_size;
         const scan = self.scans[scan_index];
-
-        const packet_offset = packet_pos + scan.data_offset;
-        if (packet_offset >= file_size) {
-            return error.OffsetBeyondFile;
-        }
-
-        const header_size = 32;
-        if (packet_offset + header_size > file_size) {
-            return error.Truncated;
-        }
-        const header_bytes = mm.memory[packet_offset..packet_offset + header_size];
-        const h = advanced.PacketHeader{
-            .num_segments = std.mem.readInt(u32, header_bytes[0..4], .little),
-            .num_profile_words = std.mem.readInt(u32, header_bytes[4..8], .little),
-            .num_centroid_words = std.mem.readInt(u32, header_bytes[8..12], .little),
-            .default_feature_word = std.mem.readInt(u32, header_bytes[12..16], .little),
-            .num_non_default_feature_words = std.mem.readInt(u32, header_bytes[16..20], .little),
-            .num_expansion_words = std.mem.readInt(u32, header_bytes[20..24], .little),
-            .num_noise_info_words = std.mem.readInt(u32, header_bytes[24..28], .little),
-            .num_debug_info_words = std.mem.readInt(u32, header_bytes[28..32], .little),
-        };
-        const packet_size = advanced.packetSizeFromHeader(h);
-        const actual_size: usize = @intCast(@min(packet_size, file_size - packet_offset));
-        if (actual_size == 0) return error.Truncated;
-
-        const packet_slice = mm.memory[packet_offset..packet_offset + actual_size];
-
-        // Determine packet type and estimate output size
-        const is_profile = scan.packet_type == raw.PACKET_TYPE_FT_PROFILE;
-        const est_peaks: usize = if (is_profile) blk: {
-            const segment_data_start = 32 + @as(usize, h.num_segments) * 8;
-            var seg_pos = segment_data_start;
-            var total_expanded: usize = 0;
-            var seg: u32 = 0;
-            while (seg < h.num_segments) : (seg += 1) {
-                if (packet_slice.len >= seg_pos + 24) {
-                    const num_expanded = std.mem.readInt(u32, packet_slice[seg_pos + 20 ..][0..4], .little);
-                    total_expanded += num_expanded;
-                }
-                seg_pos += 24;
-            }
-            break :blk @intCast(@max(64, total_expanded));
-        } else blk: {
-            const accurate = h.accurateMassCentroids();
-            const entry_size: u64 = if (accurate) 12 else 8;
-            break :blk @intCast(@max(64, h.num_centroid_words * 4 / entry_size));
-        };
-
-        // Grow reusable buffers if needed
-        if (self.reuse_mz == null or self.reuse_mz.?.len < est_peaks) {
-            if (self.reuse_mz) |old| self.allocator.free(old);
-            self.reuse_mz = self.allocator.alloc(f64, est_peaks) catch return error.OutOfMemory;
-        }
-        if (self.reuse_intensity == null or self.reuse_intensity.?.len < est_peaks) {
-            if (self.reuse_intensity) |old| self.allocator.free(old);
-            self.reuse_intensity = self.allocator.alloc(f32, est_peaks) catch return error.OutOfMemory;
-        }
-        if (self.reuse_freq == null or self.reuse_freq.?.len < est_peaks) {
-            if (self.reuse_freq) |old| self.allocator.free(old);
-            self.reuse_freq = self.allocator.alloc(f64, est_peaks) catch return error.OutOfMemory;
-        }
-
-        // For FT_PROFILE packets with embedded centroid data, decode centroids instead of profile
-        const has_centroid_data = h.num_centroid_words > 0;
-        const num_points = if (is_profile and !has_centroid_data) blk: {
-            var calibrators: []const f64 = &[_]f64{};
-            if (self.trailer_events) |te| {
-                if (te.getEvent(scan_index)) |evt| {
-                    calibrators = evt.mass_calibrators;
-                }
-            }
-            const use_subsegment = (h.default_feature_word & 0x40) == 0
-                and (h.default_feature_word & 0x80) != 0;
-            break :blk try profile.decodeFtProfileWithFreq(
-                packet_slice, calibrators, self.reuse_freq.?, self.reuse_mz.?, self.reuse_intensity.?, use_subsegment);
-        } else advanced.decodeSimplifiedCentroidsIntoBuffers(
-            packet_slice, 0, self.reuse_mz.?, self.reuse_intensity.?, null,
-        ) catch |err| switch (err) {
-            advanced.PacketError.OutOfMemory => return error.OutOfMemory,
-            else => return error.Truncated,
-        };
-
-        self.scans[scan_index].peak_count = num_points;
-        return num_points;
+        const result = try self.decoder.decode(
+            scan_index,
+            &.{ .packet_type = scan.packet_type, .data_offset = scan.data_offset },
+            .reuse_with_freq,
+        );
+        self.scans[scan_index].peak_count = result.num_points;
+        return result.num_points;
     }
 
     /// Parse first N scan trailers eagerly (for scan list display), rest on demand.
