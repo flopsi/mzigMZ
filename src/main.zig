@@ -9,6 +9,7 @@
 const std = @import("std");
 const ap = @import("advanced_packet");
 const raw = @import("raw_file");
+const raw_file_reader = @import("raw_file_reader");
 const main_window = @import("main_window");
 const app = @import("app_state");
 
@@ -177,7 +178,7 @@ fn runLegacyMode(allocator: std.mem.Allocator, io: std.Io, raw_path: []const u8,
 
     const file_size = (try file.stat(io)).size;
 
-    const packet_offset = try resolvePacketOffset(file, io, mode, value, file_size);
+    const packet_offset = try resolvePacketOffset(allocator, io, raw_path, mode, value);
 
     if (packet_offset >= file_size) {
         std.debug.print(
@@ -222,7 +223,7 @@ fn runLegacyMode(allocator: std.mem.Allocator, io: std.Io, raw_path: []const u8,
     try viewer.run(&spectrum);
 }
 
-fn resolvePacketOffset(file: std.Io.File, io: std.Io, mode: []const u8, value: []const u8, file_size: u64) !u64 {
+fn resolvePacketOffset(allocator: std.mem.Allocator, io: std.Io, raw_path: []const u8, mode: []const u8, value: []const u8) !u64 {
     if (std.mem.eql(u8, mode, "offset")) {
         return std.fmt.parseInt(u64, value, 0) catch |err| {
             std.debug.print("error: cannot parse absolute offset '{s}': {}\n", .{ value, err });
@@ -235,32 +236,50 @@ fn resolvePacketOffset(file: std.Io.File, io: std.Io, mode: []const u8, value: [
             std.debug.print("error: cannot parse scan number '{s}': {}\n", .{ value, err });
             std.process.exit(1);
         };
-        const resolved = raw.resolveScan(file, io, scan_number) catch |err| {
+
+        // Use the mmap-backed RawFile module. This does the same work as
+        // the old pread-based resolveScan but in one zero-syscall call.
+        var rf = raw_file_reader.RawFile.open(allocator, io, raw_path) catch |err| {
+            std.debug.print("error: failed to open '{s}': {}\n", .{ raw_path, err });
+            std.process.exit(1);
+        };
+        defer rf.deinit();
+
+        const entry = rf.scanAt(scan_number) catch |err| {
             std.debug.print("error: failed to resolve scan {d}: {}\n", .{ scan_number, err });
             std.process.exit(1);
         };
 
+        const scan_index_size = raw.scanIndexSize(rf.file_revision);
+        const zero_based: u64 = @intCast(scan_number - rf.first_spectrum);
+        const scan_index_pos: u64 = rf.scan_table_start + zero_based * scan_index_size;
+
         std.debug.print(
             "info: file rev {d}, MS controller {d}, scan range {d}-{d}\n",
-            .{ resolved.file_revision, resolved.ms_controller_index, resolved.first_spectrum, resolved.last_spectrum },
+            .{ rf.file_revision, rf.ms_controller_index, rf.first_spectrum, rf.last_spectrum },
         );
         std.debug.print(
             "info: scan {d} index @ 0x{x}, packet type {d}, relative DataOffset 0x{x}\n",
-            .{ resolved.scan_index.scan_number, resolved.scan_index_pos, resolved.scan_index.packet_type, resolved.scan_index.data_offset },
-        );
-        std.debug.print(
-            "info: PacketPos 0x{x} + DataOffset 0x{x} = absolute packet offset 0x{x}\n",
-            .{ resolved.packet_pos, resolved.scan_index.data_offset, resolved.absolute_packet_offset },
+            .{ entry.scan_number, scan_index_pos, entry.packet_type, entry.data_offset },
         );
 
-        if (resolved.absolute_packet_offset >= file_size) {
+        const absolute_packet_offset = rf.packetOffset(scan_number) catch |err| {
+            std.debug.print("error: failed to compute packet offset: {}\n", .{err});
+            std.process.exit(1);
+        };
+        std.debug.print(
+            "info: PacketPos 0x{x} + DataOffset 0x{x} = absolute packet offset 0x{x}\n",
+            .{ rf.packet_pos, entry.data_offset, absolute_packet_offset },
+        );
+
+        if (absolute_packet_offset >= rf.file_size) {
             std.debug.print(
                 "error: resolved packet offset 0x{x} is beyond end of file ({d} bytes)\n",
-                .{ resolved.absolute_packet_offset, file_size },
+                .{ absolute_packet_offset, rf.file_size },
             );
             std.process.exit(1);
         }
-        return resolved.absolute_packet_offset;
+        return absolute_packet_offset;
     }
 
     std.debug.print("error: unknown mode '{s}'\n\n", .{mode});

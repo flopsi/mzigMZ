@@ -54,6 +54,7 @@ pub const RawFile = struct {
     // Scan table location within the mmap
     scan_table_start: u64, // offset of first scan index entry
     scan_table_size: u64, // num_scans * scanIndexSize
+    trailer_scan_events_pos: u64, // 0 if not present in this file
 
     // Allocated strings (freed in deinit)
     creation_time_iso: ?[]u8,
@@ -103,7 +104,6 @@ pub const RawFile = struct {
 
         const raw_info_offset = pos;
         const result = try resolveMsController(mm.memory, raw_info_offset);
-        const ms_controller_index = result.ms_controller_index;
         const controller_offset = result.controller_offset;
 
         // Authoritative instrument identity (overrides sequence-row model if present).
@@ -123,6 +123,7 @@ pub const RawFile = struct {
 
         const spectrum_pos_i64 = try raw.readI64Mm(mm.memory, controller_offset + raw.RUN_HEADER_SPECT_POS);
         const packet_pos_i64 = try raw.readI64Mm(mm.memory, controller_offset + raw.RUN_HEADER_PACKET_POS);
+        const trailer_pos_i64 = try raw.readI64Mm(mm.memory, controller_offset + raw.RUN_HEADER_TRAILER_SCAN_EVENTS_POS);
         if (spectrum_pos_i64 <= 0 or packet_pos_i64 <= 0) {
             return error.InvalidRunHeader;
         }
@@ -157,13 +158,14 @@ pub const RawFile = struct {
             .file_size = file_size,
             .file_revision = file_revision,
             .raw_info_offset = raw_info_offset,
-            .ms_controller_index = ms_controller_index,
+            .ms_controller_index = result.ms_controller_index,
             .controller_offset = controller_offset,
             .first_spectrum = first_spectrum,
             .last_spectrum = last_spectrum,
             .spectrum_pos = spectrum_pos,
             .packet_pos = packet_pos,
             .num_scans = num_scans,
+            .trailer_scan_events_pos = if (trailer_pos_i64 > 0) @intCast(trailer_pos_i64) else 0,
             .scan_table_start = spectrum_pos,
             .scan_table_size = scan_table_size,
             .creation_time_iso = creation_time_iso,

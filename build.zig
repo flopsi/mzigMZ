@@ -213,6 +213,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     test_trailer_mod.addImport("raw_file", raw_file_mod);
+    test_trailer_mod.addImport("raw_file_reader", raw_file_reader_mod);
     test_trailer_mod.addImport("scan_event", scan_event_mod);
     test_trailer_mod.addImport("trailer_events", trailer_events_mod);
 
