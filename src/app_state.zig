@@ -2,6 +2,7 @@
 const std = @import("std");
 const advanced = @import("advanced_packet");
 const raw = @import("raw_file");
+const raw_file_reader = @import("raw_file_reader");
 const scan_event = @import("scan_event");
 const trailer_events = @import("trailer_events");
 const profile = @import("profile_packet");
@@ -135,19 +136,10 @@ pub const AppState = struct {
 
     // Current file
     file_path: ?[]const u8,
-    file_handle: ?std.Io.File,
-    file_size: u64,
-    mm: ?std.Io.File.MemoryMap,
+    raw_file: ?raw_file_reader.RawFile,
 
     // Scan list
     scans: []ScanInfo,
-    first_spectrum: i32,
-    last_spectrum: i32,
-    file_revision: u16,
-    ms_controller_index: usize,
-    controller_offset: u64,
-    spectrum_pos: u64,
-    packet_pos: u64,
 
     // Current spectrum
     current_spectrum: ?advanced.Spectrum,
@@ -203,17 +195,8 @@ pub const AppState = struct {
             .allocator = allocator,
             .io = io,
             .file_path = null,
-            .file_handle = null,
-            .file_size = 0,
-            .mm = null,
+            .raw_file = null,
             .scans = &.{},
-            .first_spectrum = 0,
-            .last_spectrum = 0,
-            .file_revision = 0,
-            .ms_controller_index = 0,
-            .controller_offset = 0,
-            .spectrum_pos = 0,
-            .packet_pos = 0,
             .current_spectrum = null,
             .current_scan_index = 0,
             .zoom = undefined,
@@ -316,12 +299,9 @@ pub const AppState = struct {
                 entry_opt.* = null;
             }
         }
-        if (self.mm) |*mm| {
-            mm.destroy(self.io);
-            self.mm = null;
-        }
-        if (self.file_handle) |fh| {
-            fh.close(self.io);
+        if (self.raw_file) |*rf| {
+            rf.deinit();
+            self.raw_file = null;
         }
         self.allocator.free(self.file_path orelse &[_]u8{});
         self.allocator.free(self.scans);
@@ -333,159 +313,62 @@ pub const AppState = struct {
         self.deinit();
         self.* = init(self.allocator, self.io);
 
-        const file = try std.Io.Dir.openFile(std.Io.Dir.cwd(), self.io, path, .{});
-        errdefer file.close(self.io);
-
-        const file_size = (try file.stat(self.io)).size;
-
-        // Security: validate file size limits
-        const MAX_FILE_SIZE: u64 = 64 * 1024 * 1024 * 1024; // 64 GB
-        if (file_size > MAX_FILE_SIZE) {
-            return error.FileTooLarge;
-        }
-        if (file_size < 8) {
-            return error.Truncated;
-        }
-
-        // Copy path
-        const path_copy = try self.allocator.dupe(u8, path);
-        errdefer self.allocator.free(path_copy);
-
-        self.file_path = path_copy;
-        self.file_handle = file;
-        self.file_size = file_size;
-
-        // Memory-map the entire file — eliminates all pread syscalls
-        const mm = try std.Io.File.createMemoryMap(file, self.io, .{
-            .len = @intCast(file_size),
-            .protection = .{ .read = true },
-        });
-        self.mm = mm;
-
-        // Security: validate RAW file signature
-        // Thermo RAW files use two formats:
-        //   - Older Finnigan format: 0x01 0xA1 at offset 0, followed by "Finnigan"
-        //   - Newer OLE2 format: D0 CF 11 E0 A1 B1 1A E1 (Compound Document)
-        const is_finnigan = mm.memory.len >= 2 and mm.memory[0] == 0x01 and mm.memory[1] == 0xA1;
-        const OLE2_MAGIC = [8]u8{ 0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1 };
-        const is_ole2 = mm.memory.len >= 8 and std.mem.eql(u8, mm.memory[0..8], &OLE2_MAGIC);
-        if (!is_finnigan and !is_ole2) {
-            return error.InvalidRawFile;
-        }
-
-        // Read creation time from file header (offset 40 = Created.TimeStamp FILETIME)
-        if (file_size >= 48) {
-            const ft_low = std.mem.readInt(u32, mm.memory[40..44], .little);
-            const ft_high = std.mem.readInt(u32, mm.memory[44..48], .little);
-            const filetime = (@as(u64, ft_high) << 32) | ft_low;
-            if (filetime > 0) {
-                self.creation_time = fileTimeToIso8601(self.allocator, filetime) catch null;
-                if (self.creation_time) |ct| {
-                    std.log.info("RAW CreationDate: {s}", .{ct});
-                }
-            }
-        }
-
-        // Read file metadata directly from memory map — zero syscalls
-        const mm_mem = mm.memory;
-        const file_revision = try raw.readU16Mm(mm_mem, raw.FILE_REV_OFFSET);
-        if (file_revision < 65) {
-            return error.UnsupportedFileRevision;
-        }
-        self.file_revision = file_revision;
-
-        var pos: u64 = raw.FILE_HEADER_SIZE;
-        const meta = try raw.readSequenceRowMetadata(self.allocator, file, self.io, &pos, file_revision);
-        if (meta.inst) |inst| {
-            self.instrument_model = inst;
-        }
-        try raw.skipAutoSamplerConfig(file, self.io, &pos, file_revision);
-
-        const raw_info_offset = pos;
-        const controller_count_i32 = try raw.readI32Mm(mm_mem, raw_info_offset + raw.RAW_INFO_NUM_CONTROLLERS);
-        if (controller_count_i32 <= 0 or controller_count_i32 > 64) {
-            return error.InvalidRawFileInfo;
-        }
-        const controller_count: usize = @intCast(controller_count_i32);
-
-        var ms_controller_index: ?usize = null;
-        var controller_offset: u64 = 0;
-        var i: usize = 0;
-        while (i < controller_count) : (i += 1) {
-            const entry_base = raw_info_offset + raw.RAW_INFO_CONTROLLER_TABLE_CURRENT + @as(u64, @intCast(i)) * raw.RAW_INFO_CONTROLLER_SIZE_CURRENT;
-            const device_type = try raw.readI32Mm(mm_mem, entry_base + raw.RAW_INFO_CONTROLLER_TYPE);
-            if (device_type == raw.VIRTUAL_DEVICE_MS) {
-                const off = try raw.readI64Mm(mm_mem, entry_base + raw.RAW_INFO_CONTROLLER_OFFSET);
-                if (off <= 0) return error.InvalidControllerOffset;
-                ms_controller_index = i;
-                controller_offset = @intCast(off);
-                break;
-            }
-        }
-        if (ms_controller_index == null) return error.NoMsController;
-
-        self.ms_controller_index = ms_controller_index.?;
-        self.controller_offset = controller_offset;
-
-        // Read authoritative instrument identity from InstrumentId structure.
-        // This lives immediately after the RunHeaderStruct in the MS controller data.
-        const inst_id = raw.readInstrumentId(self.allocator, file, self.io, controller_offset, file_revision) catch |err| blk: {
-            std.log.warn("Failed to read InstrumentId: {s}, using sequence row fallback", .{@errorName(err)});
-            break :blk raw.InstrumentId{ .model = null, .serial = null, .software_version = null };
+        // Open the .raw file. This does the signature check, mmap, controller
+        // discovery, scan table parse, instrument id, and creation time in one
+        // call. Owns the mmap and the allocated strings until deinit().
+        var rf = raw_file_reader.RawFile.open(self.allocator, self.io, path) catch |err| {
+            // Map the module-local errors back to the historical AppState errors
+            // so GUI/clients don't have to know about the module split.
+            return switch (err) {
+                error.FileTooLarge => error.FileTooLarge,
+                error.Truncated => error.Truncated,
+                error.InvalidRawFile => error.InvalidRawFile,
+                error.UnsupportedFileRevision => error.UnsupportedFileRevision,
+                error.InvalidRawFileInfo => error.InvalidRawFileInfo,
+                error.NoMsController => error.NoMsController,
+                error.InvalidControllerOffset => error.InvalidControllerOffset,
+                error.InvalidRunHeader => error.InvalidRunHeader,
+                error.TooManyScans => error.TooManyScans,
+                error.InvalidStringLength => error.InvalidStringLength,
+                error.OffsetOverflow => error.OffsetOverflow,
+                error.InvalidScanNumber => error.ScanOutOfRange,
+                error.ScanOutOfRange => error.ScanOutOfRange,
+                error.ScanIndexMismatch => error.ScanIndexMismatch,
+            };
         };
-        if (inst_id.model) |model| {
-            // Prefer InstrumentId.Model over sequence row Inst field (which may be a method path)
-            if (self.instrument_model) |old| {
-                self.allocator.free(old);
-            }
-            self.instrument_model = model;
-        }
-        if (inst_id.serial) |serial| {
-            if (self.instrument_serial) |old| {
-                self.allocator.free(old);
-            }
-            self.instrument_serial = serial;
-        }
-        if (inst_id.software_version) |sw| {
-            if (self.software_version) |old| {
-                self.allocator.free(old);
-            }
-            self.software_version = sw;
-        }
 
-        const first_spectrum = try raw.readI32Mm(mm_mem, controller_offset + raw.RUN_HEADER_FIRST_SPECTRUM);
-        const last_spectrum = try raw.readI32Mm(mm_mem, controller_offset + raw.RUN_HEADER_LAST_SPECTRUM);
-        if (first_spectrum <= 0 or last_spectrum < first_spectrum) {
-            return error.InvalidRunHeader;
-        }
-        self.first_spectrum = first_spectrum;
-        self.last_spectrum = last_spectrum;
+        const path_copy = self.allocator.dupe(u8, path) catch {
+            rf.deinit();
+            return error.OutOfMemory;
+        };
+        self.file_path = path_copy;
 
-        const spectrum_pos_i64 = try raw.readI64Mm(mm_mem, controller_offset + raw.RUN_HEADER_SPECT_POS);
-        const packet_pos_i64 = try raw.readI64Mm(mm_mem, controller_offset + raw.RUN_HEADER_PACKET_POS);
-        if (spectrum_pos_i64 <= 0 or packet_pos_i64 <= 0) {
-            return error.InvalidRunHeader;
+        if (rf.creation_time_iso) |ct| {
+            std.log.info("RAW CreationDate: {s}", .{ct});
         }
-        self.spectrum_pos = @intCast(spectrum_pos_i64);
-        self.packet_pos = @intCast(packet_pos_i64);
+        self.creation_time = rf.creation_time_iso;
+        rf.creation_time_iso = null;
+        self.instrument_model = rf.instrument_model;
+        rf.instrument_model = null;
+        self.instrument_serial = rf.instrument_serial;
+        rf.instrument_serial = null;
+        self.software_version = rf.software_version;
+        rf.software_version = null;
 
-        // Build scan list — parse directly from memory-mapped file (zero copy)
-        const num_scans: usize = @intCast(last_spectrum - first_spectrum + 1);
-        const MAX_SCAN_COUNT: usize = 10_000_000;
-        if (num_scans > MAX_SCAN_COUNT) {
-            return error.TooManyScans;
-        }
+        // Build scan list — parse directly from the mmap (zero copy).
+        const file_revision = rf.file_revision;
+        const num_scans = rf.num_scans;
         const scan_index_size = raw.scanIndexSize(file_revision);
-        const scans = try self.allocator.alloc(ScanInfo, num_scans);
-        errdefer self.allocator.free(scans);
+        const mm_mem = rf.memory();
+        const scan_table_buf = mm_mem[rf.scan_table_start..][0..rf.scan_table_size];
 
-        const scan_table_size = num_scans * scan_index_size;
-        const mm_offset = self.spectrum_pos;
-        if (mm_offset + scan_table_size > mm_mem.len) {
-            return error.Truncated;
-        }
-        // Parse directly from memory map — no allocation, no copy
-        const scan_table_buf = mm_mem[mm_offset..mm_offset + scan_table_size];
+        const scans = self.allocator.alloc(ScanInfo, num_scans) catch {
+            rf.deinit();
+            self.allocator.free(path_copy);
+            self.file_path = null;
+            return error.OutOfMemory;
+        };
+        errdefer self.allocator.free(scans);
 
         var scan_idx: usize = 0;
         while (scan_idx < num_scans) : (scan_idx += 1) {
@@ -518,10 +401,11 @@ pub const AppState = struct {
         }
 
         self.scans = scans;
+        self.raw_file = rf;
 
         // Parse TrailerScanEvents to get authoritative MS level and precursor metadata.
         // trailer_offset in ScanIndexEntry is an INDEX into the scan_to_unique array.
-        try self.parseScanTrailersAtOpen(mm, controller_offset, num_scans, file_revision);
+        try self.parseScanTrailersAtOpen();
 
         // Default to MS1 filter for cleaner initial view
         self.filter_ms_level = 1;
@@ -537,13 +421,13 @@ pub const AppState = struct {
     /// Parse TrailerScanEvents at file open to get authoritative MS level and metadata.
     /// The trailer_offset field in ScanIndexEntry is an INDEX into scan_to_unique,
     /// NOT a file offset. The table lives at RunHeader.TrailerScanEventsPos.
-    fn parseScanTrailersAtOpen(
-        self: *AppState,
-        mm: std.Io.File.MemoryMap,
-        controller_offset: u64,
-        num_scans: usize,
-        file_revision: u16,
-    ) !void {
+    fn parseScanTrailersAtOpen(self: *AppState) !void {
+        const rf = &self.raw_file.?;
+        const mm = rf.mm;
+        const controller_offset = rf.controller_offset;
+        const num_scans = rf.num_scans;
+        const file_revision = rf.file_revision;
+
         // Read trailer scan events position from run header
         const trailer_pos_i64 = raw.readI64Mm(mm.memory, controller_offset + raw.RUN_HEADER_TRAILER_SCAN_EVENTS_POS) catch |err| {
             std.log.warn("Failed to read trailer position: {s}, using heuristic MS levels", .{@errorName(err)});
@@ -611,8 +495,8 @@ pub const AppState = struct {
     /// This is expensive (O(n) file reads) so it's not done at openFile time.
     /// Call this when filter strings are needed (e.g., golden validation).
     pub fn readAllScanTrailers(self: *AppState) !void {
-        if (self.mm == null) return error.NoFileOpen;
-        const mm = self.mm.?;
+        if (self.raw_file == null) return error.NoFileOpen;
+        const mm = self.raw_file.?.mm;
 
         for (self.scans) |*scan| {
             const trailer = raw.readScanTrailer(self.allocator, mm, scan.trailer_offset) catch |err| {
@@ -694,11 +578,13 @@ pub const AppState = struct {
 
     pub fn loadScan(self: *AppState, scan_index: usize) !void {
         if (scan_index >= self.scans.len) return error.ScanOutOfRange;
-        if (self.mm == null) return error.NoFileOpen;
+        if (self.raw_file == null) return error.NoFileOpen;
         // TrailerScanEvents are parsed at file open. MS level and precursor
         // metadata are already authoritative in self.scans[scan_index].
 
-        const mm = self.mm.?;
+        const mm = self.raw_file.?.mm;
+        const packet_pos = self.raw_file.?.packet_pos;
+        const file_size = self.raw_file.?.file_size;
         const scan = self.scans[scan_index];
 
         // Check packet type — we support FT centroid and FT profile packets
@@ -753,14 +639,14 @@ pub const AppState = struct {
             self.current_spectrum = null;
         }
 
-        const packet_offset = self.packet_pos + scan.data_offset;
-        if (packet_offset >= self.file_size) {
+        const packet_offset = packet_pos + scan.data_offset;
+        if (packet_offset >= file_size) {
             return error.OffsetBeyondFile;
         }
 
         // Read packet header to compute exact size
         const header_size = 32;
-        if (packet_offset + header_size > self.file_size) {
+        if (packet_offset + header_size > file_size) {
             return error.Truncated;
         }
         const header_bytes = mm.memory[packet_offset..packet_offset + header_size];
@@ -776,7 +662,7 @@ pub const AppState = struct {
         };
         const packet_size = advanced.packetSizeFromHeader(h);
 
-        const actual_size: usize = @intCast(@min(packet_size, self.file_size - packet_offset));
+        const actual_size: usize = @intCast(@min(packet_size, file_size - packet_offset));
         if (actual_size == 0) {
             return error.Truncated;
         }
@@ -1081,7 +967,7 @@ pub const AppState = struct {
     }
 
     pub fn hasFileOpen(self: AppState) bool {
-        return self.file_handle != null;
+        return self.raw_file != null;
     }
 
     pub fn hasSpectrum(self: AppState) bool {
@@ -1092,18 +978,20 @@ pub const AppState = struct {
     /// This is ~10x faster than per-scan alloc/free for bulk iteration (B5).
     pub fn loadScanArena(self: *AppState, scan_index: usize, arena: *std.heap.ArenaAllocator) !usize {
         if (scan_index >= self.scans.len) return error.ScanOutOfRange;
-        if (self.mm == null) return error.NoFileOpen;
+        if (self.raw_file == null) return error.NoFileOpen;
 
-        const mm = self.mm.?;
+        const mm = self.raw_file.?.mm;
+        const packet_pos = self.raw_file.?.packet_pos;
+        const file_size = self.raw_file.?.file_size;
         const scan = self.scans[scan_index];
 
-        const packet_offset = self.packet_pos + scan.data_offset;
-        if (packet_offset >= self.file_size) {
+        const packet_offset = packet_pos + scan.data_offset;
+        if (packet_offset >= file_size) {
             return error.OffsetBeyondFile;
         }
 
         const header_size = 32;
-        if (packet_offset + header_size > self.file_size) {
+        if (packet_offset + header_size > file_size) {
             return error.Truncated;
         }
         const header_bytes = mm.memory[packet_offset..packet_offset + header_size];
@@ -1118,7 +1006,7 @@ pub const AppState = struct {
             .num_debug_info_words = std.mem.readInt(u32, header_bytes[28..32], .little),
         };
         const packet_size = advanced.packetSizeFromHeader(h);
-        const actual_size: usize = @intCast(@min(packet_size, self.file_size - packet_offset));
+        const actual_size: usize = @intCast(@min(packet_size, file_size - packet_offset));
         if (actual_size == 0) return error.Truncated;
 
         const packet_slice = mm.memory[packet_offset..packet_offset + actual_size];
@@ -1183,18 +1071,20 @@ pub const AppState = struct {
     /// Reuses grow-only buffers; no allocator calls, no copies. Returns point count.
     pub fn loadScanBulk(self: *AppState, scan_index: usize) !usize {
         if (scan_index >= self.scans.len) return error.ScanOutOfRange;
-        if (self.mm == null) return error.NoFileOpen;
+        if (self.raw_file == null) return error.NoFileOpen;
 
-        const mm = self.mm.?;
+        const mm = self.raw_file.?.mm;
+        const packet_pos = self.raw_file.?.packet_pos;
+        const file_size = self.raw_file.?.file_size;
         const scan = self.scans[scan_index];
 
-        const packet_offset = self.packet_pos + scan.data_offset;
-        if (packet_offset >= self.file_size) {
+        const packet_offset = packet_pos + scan.data_offset;
+        if (packet_offset >= file_size) {
             return error.OffsetBeyondFile;
         }
 
         const header_size = 32;
-        if (packet_offset + header_size > self.file_size) {
+        if (packet_offset + header_size > file_size) {
             return error.Truncated;
         }
         const header_bytes = mm.memory[packet_offset..packet_offset + header_size];
@@ -1209,7 +1099,7 @@ pub const AppState = struct {
             .num_debug_info_words = std.mem.readInt(u32, header_bytes[28..32], .little),
         };
         const packet_size = advanced.packetSizeFromHeader(h);
-        const actual_size: usize = @intCast(@min(packet_size, self.file_size - packet_offset));
+        const actual_size: usize = @intCast(@min(packet_size, file_size - packet_offset));
         if (actual_size == 0) return error.Truncated;
 
         const packet_slice = mm.memory[packet_offset..packet_offset + actual_size];
@@ -1250,8 +1140,8 @@ pub const AppState = struct {
         // Prefetch next scan's data if available (overlaps memory fetch with decode)
         if (scan_index + 1 < self.scans.len) {
             const next_scan = self.scans[scan_index + 1];
-            const next_offset = self.packet_pos + next_scan.data_offset;
-            if (next_offset < self.file_size) {
+            const next_offset = packet_pos + next_scan.data_offset;
+            if (next_offset < file_size) {
                 @prefetch(mm.memory.ptr + next_offset, .{ .rw = .read, .cache = .data, .locality = 3 });
             }
         }
@@ -1284,18 +1174,20 @@ pub const AppState = struct {
     /// Identical to loadScanBulk but also populates reuse_freq with raw frequencies.
     pub fn loadScanBulkWithFreq(self: *AppState, scan_index: usize) !usize {
         if (scan_index >= self.scans.len) return error.ScanOutOfRange;
-        if (self.mm == null) return error.NoFileOpen;
+        if (self.raw_file == null) return error.NoFileOpen;
 
-        const mm = self.mm.?;
+        const mm = self.raw_file.?.mm;
+        const packet_pos = self.raw_file.?.packet_pos;
+        const file_size = self.raw_file.?.file_size;
         const scan = self.scans[scan_index];
 
-        const packet_offset = self.packet_pos + scan.data_offset;
-        if (packet_offset >= self.file_size) {
+        const packet_offset = packet_pos + scan.data_offset;
+        if (packet_offset >= file_size) {
             return error.OffsetBeyondFile;
         }
 
         const header_size = 32;
-        if (packet_offset + header_size > self.file_size) {
+        if (packet_offset + header_size > file_size) {
             return error.Truncated;
         }
         const header_bytes = mm.memory[packet_offset..packet_offset + header_size];
@@ -1310,7 +1202,7 @@ pub const AppState = struct {
             .num_debug_info_words = std.mem.readInt(u32, header_bytes[28..32], .little),
         };
         const packet_size = advanced.packetSizeFromHeader(h);
-        const actual_size: usize = @intCast(@min(packet_size, self.file_size - packet_offset));
+        const actual_size: usize = @intCast(@min(packet_size, file_size - packet_offset));
         if (actual_size == 0) return error.Truncated;
 
         const packet_slice = mm.memory[packet_offset..packet_offset + actual_size];

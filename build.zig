@@ -36,6 +36,14 @@ pub fn build(b: *std.Build) void {
     });
     scan_event_mod.addImport("raw_file", raw_file_mod);
 
+    // ---- raw_core/raw_file_reader module -----------------------------------
+    const raw_file_reader_mod = b.createModule(.{
+        .root_source_file = b.path("src/raw_core/raw_file_reader.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    raw_file_reader_mod.addImport("raw_file", raw_file_mod);
+
     // ---- raw_core/trailer_events module -----------------------------------
     const trailer_events_mod = b.createModule(.{
         .root_source_file = b.path("src/raw_core/trailer_events.zig"),
@@ -53,6 +61,7 @@ pub fn build(b: *std.Build) void {
     });
     app_state_mod.addImport("advanced_packet", packet_mod);
     app_state_mod.addImport("raw_file", raw_file_mod);
+    app_state_mod.addImport("raw_file_reader", raw_file_reader_mod);
     app_state_mod.addImport("scan_event", scan_event_mod);
     app_state_mod.addImport("trailer_events", trailer_events_mod);
     app_state_mod.addImport("profile_packet", profile_mod);
@@ -130,6 +139,7 @@ pub fn build(b: *std.Build) void {
     });
     exe_mod.addImport("advanced_packet", packet_mod);
     exe_mod.addImport("raw_file", raw_file_mod);
+    exe_mod.addImport("raw_file_reader", raw_file_reader_mod);
     exe_mod.addImport("win32_viewer", gui_mod);
     exe_mod.addImport("main_window", main_window_mod);
     exe_mod.addImport("app_state", app_state_mod);

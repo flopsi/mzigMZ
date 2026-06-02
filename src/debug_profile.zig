@@ -57,9 +57,9 @@ pub fn main(init: std.process.Init) !void {
         for (state.scans, 0..) |scan, i| {
             const pt = scan.packet_type & 0xFFFF;
             if (pt == raw.PACKET_TYPE_FT_PROFILE) {
-                const packet_offset = state.packet_pos + scan.data_offset;
-                if (packet_offset + 32 > state.file_size) continue;
-                const header_bytes = state.mm.?.memory[packet_offset..packet_offset + 32];
+                const packet_offset = state.raw_file.?.packet_pos + scan.data_offset;
+                if (packet_offset + 32 > state.raw_file.?.file_size) continue;
+                const header_bytes = state.raw_file.?.mm.memory[packet_offset..packet_offset + 32];
                 const num_centroid_words = std.mem.readInt(u32, header_bytes[8..12], .little);
                 if (num_centroid_words == 0) {
                     scan_index = i;
@@ -75,8 +75,8 @@ pub fn main(init: std.process.Init) !void {
     }
 
     const scan = state.scans[scan_index];
-    const packet_offset = state.packet_pos + scan.data_offset;
-    const header_bytes = state.mm.?.memory[packet_offset..packet_offset + 32];
+    const packet_offset = state.raw_file.?.packet_pos + scan.data_offset;
+    const header_bytes = state.raw_file.?.mm.memory[packet_offset..packet_offset + 32];
 
     const h = advanced.PacketHeader{
         .num_segments = std.mem.readInt(u32, header_bytes[0..4], .little),
@@ -109,8 +109,8 @@ pub fn main(init: std.process.Init) !void {
     if (scan.number_packets > 1) {
         const packet_size = advanced.packetSizeFromHeader(h);
         const next_packet_offset = packet_offset + packet_size;
-        if (next_packet_offset < state.file_size) {
-            const next_header = state.mm.?.memory[next_packet_offset..next_packet_offset + 32];
+        if (next_packet_offset < state.raw_file.?.file_size) {
+            const next_header = state.raw_file.?.mm.memory[next_packet_offset..next_packet_offset + 32];
             const next_type = std.mem.readInt(u32, next_header[16..20], .little);
             std.debug.print("\n--- Second packet at offset 0x{x} ---\n", .{next_packet_offset});
             std.debug.print("Packet type: 0x{x:04}\n", .{next_type});
@@ -122,8 +122,8 @@ pub fn main(init: std.process.Init) !void {
 
     // Try decoding with current profile decoder
     std.debug.print("\n--- Profile decode attempt ---\n", .{});
-    const actual_size: usize = @intCast(@min(packet_size, state.file_size - packet_offset));
-    const packet_slice = state.mm.?.memory[packet_offset..packet_offset + actual_size];
+    const actual_size: usize = @intCast(@min(packet_size, state.raw_file.?.file_size - packet_offset));
+    const packet_slice = state.raw_file.?.mm.memory[packet_offset..packet_offset + actual_size];
 
     var calibrators: []const f64 = &[_]f64{};
     if (state.trailer_events) |te| {
