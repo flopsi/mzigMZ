@@ -23,6 +23,10 @@ src/
 │   ├── scan_event.zig              (ScanEvent struct, variable-length)
 │   ├── trailer_events.zig          (TrailerScanEvents deduplication table)
 │   └── raw_file_reader.zig
+├── export/                         (format writers — shared Spectrum input)
+│   ├── raw_file_writer.zig         (.raw passthrough + modified export)
+│   ├── mzml_writer.zig             (.mzML XML — future)
+│   └── parquet_writer.zig          (.parquet columnar — future)
 ├── gui/                            (Win32 UI)
 │   ├── main_window.zig
 │   ├── spectrum_canvas.zig
@@ -44,6 +48,8 @@ src/
 ## Reference Data
 - **Test files**: `D:/000projects/test_files/` — 12k-scan LC-MS/MS files and large Orbitrap/Astral files
 - **Architecture reports**: `D:/tmp/mzigRead/` — HTML architecture review reports (round 1 & round 2)
+- **Architecture decisions**: `docs/adr/` — ADRs for hard-to-reverse design choices
+- **Decompiled reference**: `D:/000projects/thermo/` — Thermo DLLs (FileIoStructs for binary layout)
 
 ## Behavioral Governance
 This project follows the **Karpathy-Inspired Behavioral Guidelines** established in the workspace root.
