@@ -197,7 +197,7 @@ pub fn build(b: *std.Build) void {
 
     // ---- benchmark executable ---------------------------------------------
     const bench_mod = b.createModule(.{
-        .root_source_file = b.path("src/bench.zig"),
+        .root_source_file = b.path("src/tools/bench.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -220,7 +220,7 @@ pub fn build(b: *std.Build) void {
 
     // ---- Phase 1 test executable -------------------------------------------
     const test_trailer_mod = b.createModule(.{
-        .root_source_file = b.path("src/test_trailer_phase1.zig"),
+        .root_source_file = b.path("src/tests/test_trailer_phase1.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -243,7 +243,7 @@ pub fn build(b: *std.Build) void {
 
     // ---- C3 trailer-label sanity test -----------------------------------------
     const test_trailer_label_mod = b.createModule(.{
-        .root_source_file = b.path("src/test_trailer_label.zig"),
+        .root_source_file = b.path("src/tests/test_trailer_label.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -267,7 +267,7 @@ pub fn build(b: *std.Build) void {
 
     // ---- debug_meta executable ---------------------------------------------
     const debug_meta_mod = b.createModule(.{
-        .root_source_file = b.path("src/debug_meta.zig"),
+        .root_source_file = b.path("src/tools/debug/debug_meta.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -290,7 +290,7 @@ pub fn build(b: *std.Build) void {
 
     // ---- debug_mass executable ---------------------------------------------
     const debug_mass_mod = b.createModule(.{
-        .root_source_file = b.path("src/debug_mass.zig"),
+        .root_source_file = b.path("src/tools/debug/debug_mass.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -313,7 +313,7 @@ pub fn build(b: *std.Build) void {
 
     // ---- debug_profile executable ------------------------------------------
     const debug_profile_mod = b.createModule(.{
-        .root_source_file = b.path("src/debug_profile.zig"),
+        .root_source_file = b.path("src/tools/debug/debug_profile.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -339,7 +339,7 @@ pub fn build(b: *std.Build) void {
 
     // ---- debug_scan_dump executable ----------------------------------------
     const debug_scan_dump_mod = b.createModule(.{
-        .root_source_file = b.path("src/debug_scan_dump.zig"),
+        .root_source_file = b.path("src/tools/debug/debug_scan_dump.zig"),
         .target = target,
         .optimize = optimize,
     });
