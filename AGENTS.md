@@ -220,7 +220,7 @@ capabilities msViewer needs, publish them the same way and add a row here.
 - **"scan"** = a row in the scan index; **"packet"** = the binary record containing spectrum data. Do not interchange.
 - **"trailer"** = offset-based key-value pairs per scan; **"ScanEvent"** = the per-scan event table at file end. Different structures.
 - **"schema"** = a known `.raw` file layout (file revision + scan index size + packet header layout + checksum formula). Files matching a known schema can use the fast-path passthrough; others fall back to the slow path. See ADR-0002.
-- **Supported `.raw` revisions:** The reader accepts files with `file_revision >= 65`. Fast-path schema detection is active for revisions **65–66**; newer revisions fall back to the slow decode+encode path. Legacy revisions `< 65` are rejected at open time. See `D:/tmp/mzigRead/raw-version-mapping.md` for the full revision support table.
+- **Supported `.raw` revisions:** The reader accepts files with `file_revision >= 65`. Fast-path schema detection is active for revisions **65–66**; newer revisions fall back to the slow decode+encode path. Legacy revisions `< 65` are rejected at open time. See `docs/raw-version-mapping.md` for the full revision support table.
 - **"fast path"** = bulk `writeAll` of the pre-scan-table, packet, and trailer regions for known-schema files. 5–20× faster than per-scan decode+encode.
 - **"slow path"** = per-scan decode+encode for unknown-schema files. Correct but slow.
 - Ground truth: decode output must match ThermoRawFileParser (.NET) for the same scan.
