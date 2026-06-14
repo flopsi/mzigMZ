@@ -28,6 +28,9 @@ data/
 # Generated test artifacts
 tests/ground_truth/
 
+# Agent worktrees
+.worktrees/
+
 # Agent skills — vendored stdlib snapshots and skill scaffolding
 .pi/skills/zig-quality/sources/
 .pi/skills-main/
