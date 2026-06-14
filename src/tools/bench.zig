@@ -29,7 +29,7 @@ pub fn main(init: std.process.Init) !void {
     const raw_path = args[1];
 
     const file_size = blk: {
-        const file = std.Io.Dir.open_file(std.Io.Dir.cwd(), io, raw_path, .{}) catch |err| {
+        const file = std.Io.Dir.openFile(std.Io.Dir.cwd(), io, raw_path, .{}) catch |err| {
             std.debug.print("error: cannot open '{s}': {}\n", .{ raw_path, err });
             return;
         };

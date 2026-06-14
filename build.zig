@@ -268,6 +268,11 @@ pub fn build(b: *std.Build) void {
     raw_file_mod.addImport("spec/packet_header", spec_packet_header_mod);
     raw_file_mod.addImport("spec/scan_index", spec_scan_index_mod);
 
+    // Wire spec modules into raw_writer
+    raw_writer_mod.addImport("spec/file_header", spec_file_header_mod);
+    raw_writer_mod.addImport("spec/raw_info", spec_raw_info_mod);
+    raw_writer_mod.addImport("spec/run_header", spec_run_header_mod);
+
     // Wire spec modules into writer_primitives
     writer_primitives_mod.addImport("spec/scan_index", spec_scan_index_mod);
     writer_primitives_mod.addImport("spec/scan_event_info", spec_scan_event_info_mod);
@@ -1025,6 +1030,7 @@ pub fn build(b: *std.Build) void {
     check_checksum_mod.addImport("raw_file", raw_file_mod);
     check_checksum_mod.addImport("checksum", checksum_mod_);
     check_checksum_mod.addImport("cli_args", cli_args_mod);
+    check_checksum_mod.addImport("spec/file_header", spec_file_header_mod);
 
     const check_checksum_exe = b.addExecutable(.{
         .name = "check_checksum",

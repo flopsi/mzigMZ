@@ -43,7 +43,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     };
 
-    const file = std.Io.Dir.open_file(std.Io.Dir.cwd(), io, raw_path, .{}) catch |e| {
+    const file = std.Io.Dir.openFile(std.Io.Dir.cwd(), io, raw_path, .{}) catch |e| {
         std.debug.print("error: cannot open '{s}': {s}\n", .{ raw_path, @errorName(e) });
         return;
     };

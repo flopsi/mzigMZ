@@ -77,7 +77,7 @@ pub fn main(init: std.process.Init) !void {
 
     // Check for second packet
     if (scan.number_packets > 1) {
-        const packet_size = advanced.packet_size_from_header(h);
+        const packet_size = try advanced.packet_size_from_header(h);
         const next_packet_offset = packet_offset + packet_size;
         if (next_packet_offset < state.file.raw_file.?.file_size) {
             const next_header = state.file.raw_file.?.mm.memory[next_packet_offset .. next_packet_offset + 32];
@@ -87,7 +87,7 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    const packet_size = advanced.packet_size_from_header(h);
+    const packet_size = try advanced.packet_size_from_header(h);
     std.debug.print("\nComputed packet_size: {d} bytes (0x{x})\n", .{ packet_size, packet_size });
 
     // Try decoding with current profile decoder
@@ -145,7 +145,7 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("Monotonicity violations: {d}\n", .{violations});
 
         // Write to TSV for ground truth comparison
-        const out_file = try std.Io.Dir.createFile(.cwd(), io, "zig_profile_scan1.tsv", .{});
+        const out_file = try std.Io.Dir.cwd().createFile(io, "zig_profile_scan1.tsv", .{});
         defer out_file.close(io);
         var write_buf: [4096]u8 = undefined;
         var writer = out_file.writer(io, &write_buf);
