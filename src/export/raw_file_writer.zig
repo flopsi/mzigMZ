@@ -11,6 +11,7 @@ const reader = @import("raw_file_reader");
 const trailer_events = @import("trailer_events");
 const wp = @import("writer_primitives");
 const schema = @import("schema");
+const progress = @import("progress");
 
 pub const RawFileWriterError = error{
     CreateFailed,
@@ -74,6 +75,19 @@ pub fn passthrough(
     trailers: ?trailer_events.TrailerScanEvents,
     out_path: []const u8,
 ) RawFileWriterError!void {
+    return passthrough_with_progress(allocator, io, source, trailers, out_path, null);
+}
+
+/// Write a passthrough copy of `source` to `out_path`, reporting progress
+/// periodically (roughly every 1 %) if `progress` is non-null.
+pub fn passthrough_with_progress(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    source: *const reader.RawFile,
+    trailers: ?trailer_events.TrailerScanEvents,
+    out_path: []const u8,
+    prog: ?progress.Reporter,
+) RawFileWriterError!void {
     const detected = schema.detect_schema(
         source.memory(),
         source.file_revision,
@@ -89,10 +103,10 @@ pub fn passthrough(
     };
     if (detected) |s| {
         std.log.info("Schema detected (rev {d}), using fast path", .{s.file_revision});
-        return passthrough_fast(allocator, io, source, trailers, out_path, s);
+        return passthrough_fast(allocator, io, source, trailers, out_path, s, prog);
     }
     std.log.info("No schema match, using slow path", .{});
-    return passthrough_slow(allocator, io, source, trailers, out_path);
+    return passthrough_slow(allocator, io, source, trailers, out_path, prog);
 }
 
 /// Write a passthrough copy of `source` to `out_path`.
@@ -105,8 +119,9 @@ pub fn passthrough_slow(
     source: *const reader.RawFile,
     trailers: ?trailer_events.TrailerScanEvents,
     out_path: []const u8,
+    prog: ?progress.Reporter,
 ) RawFileWriterError!void {
-    const out_file = std.Io.Dir.createFile(.cwd(), io, out_path, .{ .read = true }) catch |e| {
+    const out_file = std.Io.Dir.cwd().createFile(io, out_path, .{ .read = true }) catch |e| {
         std.log.err("Failed to create {s}: {s}", .{ out_path, @errorName(e) });
         return error.CreateFailed;
     };
@@ -122,6 +137,7 @@ pub fn passthrough_slow(
     const packet_pos = std.math.cast(usize, source.packet_pos) orelse return error.OffsetOverflow;
     const scan_index_size = raw.scan_index_size(source.file_revision);
     const num_scans = source.num_scans;
+    const progress_interval = @max(1, num_scans / 100);
 
     // --- Pass 1: decode+encode every scan to compute exact new sizes ---
     var scan_infos = try allocator.alloc(ScanEncodeInfo, num_scans);
@@ -151,6 +167,9 @@ pub fn passthrough_slow(
     var re_encoded: usize = 0;
 
     for (0..num_scans) |scan_idx| {
+        if (scan_idx % progress_interval == 0 or scan_idx == num_scans - 1) {
+            if (prog) |p| p.report(scan_idx + 1, num_scans * 2);
+        }
         const offset = checkedScanOffset(scan_table_start, scan_idx, scan_index_size) catch |e| {
             std.log.warn("Scan-table offset overflow for scan {d}: {s}", .{ scan_idx, @errorName(e) });
             scan_infos[scan_idx] = .{
@@ -399,6 +418,9 @@ pub fn passthrough_slow(
 
     // --- Pass 2: overwrite packet regions in-place via positional writes ---
     for (scan_infos, 0..) |info, scan_idx| {
+        if (scan_idx % progress_interval == 0 or scan_idx == num_scans - 1) {
+            if (prog) |p| p.report(num_scans + scan_idx + 1, num_scans * 2);
+        }
         if (info.encode_verbatim) continue;
 
         const packet_offset = checkedPacketOffset(packet_pos, info.orig_entry.data_offset) catch continue;
@@ -511,10 +533,11 @@ pub fn passthrough_fast(
     trailers: ?trailer_events.TrailerScanEvents,
     out_path: []const u8,
     file_schema: schema.FileSchema,
+    prog: ?progress.Reporter,
 ) RawFileWriterError!void {
     _ = trailers; // unused in fast path (no per-scan trailer decisions)
 
-    const out_file = std.Io.Dir.createFile(.cwd(), io, out_path, .{ .read = true }) catch |e| {
+    const out_file = std.Io.Dir.cwd().createFile(io, out_path, .{ .read = true }) catch |e| {
         std.log.err("Failed to create {s}: {s}", .{ out_path, @errorName(e) });
         return error.CreateFailed;
     };
@@ -529,6 +552,7 @@ pub fn passthrough_fast(
     const packet_pos = std.math.cast(usize, source.packet_pos) orelse return error.OffsetOverflow;
     const scan_index_size = raw.scan_index_size(source.file_revision);
     const num_scans = source.num_scans;
+    const progress_interval = @max(1, num_scans / 100);
 
     // Pre-allocated encode buffers (grow on demand)
     var mz_buf = try allocator.alloc(f64, 4096);
@@ -551,6 +575,9 @@ pub fn passthrough_fast(
     var re_encoded: usize = 0;
     var verbatim_count: usize = 0;
     for (0..num_scans) |scan_idx| {
+        if (scan_idx % progress_interval == 0 or scan_idx == num_scans - 1) {
+            if (prog) |p| p.report(scan_idx + 1, num_scans);
+        }
         const entry_offset = checkedScanOffset(scan_table_start, scan_idx, scan_index_size) catch continue;
         const entry = raw.parse_scan_index(src_mm, entry_offset, source.file_revision) catch continue;
 

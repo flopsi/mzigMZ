@@ -41,6 +41,7 @@ tests/ground_truth/
 /nul
 /*.exe
 /*.pdb
+/imgui.ini
 /zig-pkg/
 /.scratch/
 

@@ -5,6 +5,7 @@ const AppState = @import("app_state").AppState;
 const raw_writer = @import("raw_file_writer");
 const streaming = @import("streaming_convert");
 const mzml_writer = @import("mzml_writer");
+const progress = @import("progress");
 
 pub const ExportFormat = enum { raw, mzml };
 
@@ -66,16 +67,16 @@ pub fn start(
     const path_copy = try allocator.dupe(u8, output_path);
     errdefer allocator.free(path_copy);
 
-    const progress = try allocator.create(Progress);
-    errdefer allocator.destroy(progress);
-    progress.* = .{
+    const progress_ptr = try allocator.create(Progress);
+    errdefer allocator.destroy(progress_ptr);
+    progress_ptr.* = .{
         .mutex = &self.mutex,
         .io = state.io,
         .current = &self.current_scan,
-        .total = self.total_scans,
+        .total = &self.total_scans,
     };
 
-    const future = state.io.async(exportWorker, .{ allocator, state, format, path_copy, progress, self });
+    const future = state.io.async(exportWorker, .{ allocator, state, format, path_copy, progress_ptr, self });
     self.future = future;
 }
 
@@ -83,12 +84,29 @@ const Progress = struct {
     mutex: *std.Io.Mutex,
     io: std.Io,
     current: *usize,
-    total: usize,
+    total: *usize,
 
-    pub fn report(self: *Progress, n: usize) void {
+    pub fn report(self: *Progress, n: usize, t: usize) void {
         self.mutex.lockUncancelable(self.io);
         self.current.* = n;
+        self.total.* = t;
         self.mutex.unlock(self.io);
+    }
+};
+
+const ProgressReporter = struct {
+    progress: *Progress,
+
+    pub fn reporter(self: *ProgressReporter) progress.Reporter {
+        return .{
+            .ptr = self,
+            .vtable = &.{ .report = reportFn },
+        };
+    }
+
+    fn reportFn(ptr: *anyopaque, current: usize, total: usize) void {
+        const self: *ProgressReporter = @ptrCast(@alignCast(ptr));
+        self.progress.report(current, total);
     }
 };
 
@@ -97,10 +115,10 @@ fn exportWorker(
     state: *AppState,
     format: ExportFormat,
     output_path: []const u8,
-    progress: *Progress,
+    progress_ptr: *Progress,
     self: *ExportState,
 ) void {
-    defer allocator.destroy(progress);
+    defer allocator.destroy(progress_ptr);
     defer allocator.free(output_path);
 
     const source_name = if (state.file.file_path) |p|
@@ -108,15 +126,19 @@ fn exportWorker(
     else
         "unknown.raw";
 
+    var reporter_adapter = ProgressReporter{ .progress = progress_ptr };
+    const reporter = reporter_adapter.reporter();
+
     const result = switch (format) {
-        .raw => raw_writer.passthrough(
+        .raw => raw_writer.passthrough_with_progress(
             allocator,
             state.io,
             &state.file.raw_file.?,
             state.file.trailer_events,
             output_path,
+            reporter,
         ),
-        .mzml => streaming.convert_raw_to_mzml_streaming(
+        .mzml => streaming.convert_raw_to_mzml_streaming_with_progress(
             state.io,
             allocator,
             state,
@@ -128,6 +150,7 @@ fn exportWorker(
                 .precision = .f64,
                 .use_indexed_mzml = false,
             },
+            reporter,
         ),
     };
 
@@ -175,8 +198,9 @@ pub fn draw_modal(self: *ExportState) bool {
         else blk: {
             self.mutex.lockUncancelable(self.io);
             const current = self.current_scan;
+            const total = self.total_scans;
             self.mutex.unlock(self.io);
-            break :blk @as(f32, @floatFromInt(current)) / @as(f32, @floatFromInt(self.total_scans));
+            break :blk @as(f32, @floatFromInt(current)) / @as(f32, @floatFromInt(total));
         };
         ig.ImGui_ProgressBar(fraction, .{ .x = -1, .y = 0 }, null);
 

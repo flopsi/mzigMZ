@@ -76,7 +76,7 @@ pub const RawFile = struct {
     /// instrument + creation-time metadata. The returned `RawFile`
     /// owns the mmap and the allocated strings; call `deinit` to free.
     pub fn open(allocator: std.mem.Allocator, io: std.Io, path: []const u8) RawFileError!RawFile {
-        const file = std.Io.Dir.openFile(std.Io.Dir.cwd(), io, path, .{}) catch {
+        const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch {
             return error.InvalidRawFile;
         };
         errdefer file.close(io);

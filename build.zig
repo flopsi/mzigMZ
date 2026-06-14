@@ -168,6 +168,13 @@ pub fn build(b: *std.Build) void {
     schema_mod_.addImport("raw_file", raw_file_mod);
     schema_mod_.addImport("advanced_packet", packet_mod);
 
+    // ---- core/progress module ---------------------------------------------
+    const core_progress_mod = b.createModule(.{
+        .root_source_file = b.path("src/core/progress.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // ---- export/raw_file_writer module --------------------------------------
     const raw_file_writer_mod = b.createModule(.{
         .root_source_file = b.path("src/export/raw_file_writer.zig"),
@@ -181,6 +188,7 @@ pub fn build(b: *std.Build) void {
     raw_file_writer_mod.addImport("trailer_events", trailer_events_mod);
     raw_file_writer_mod.addImport("writer_primitives", writer_primitives_mod);
     raw_file_writer_mod.addImport("schema", schema_mod_);
+    raw_file_writer_mod.addImport("progress", core_progress_mod);
 
     // ---- file_state module ------------------------------------------------
     const file_state_mod = b.createModule(.{
@@ -379,6 +387,7 @@ pub fn build(b: *std.Build) void {
     mzml_streaming_convert_mod.addImport("cv", mzml_cv_mod);
     mzml_streaming_convert_mod.addImport("filter_string", filter_string_mod);
     mzml_streaming_convert_mod.addImport("instrument_utils", core_instrument_utils_mod);
+    mzml_streaming_convert_mod.addImport("progress", core_progress_mod);
 
     // ---- cli modules -------------------------------------------------------
     const cli_args_internal_mod = b.createModule(.{
@@ -580,6 +589,7 @@ pub fn build(b: *std.Build) void {
     zgui_viewer_mod.addImport("raw_file_writer", raw_file_writer_mod);
     zgui_viewer_mod.addImport("streaming_convert", mzml_streaming_convert_mod);
     zgui_viewer_mod.addImport("mzml_writer", mzml_writer_mod);
+    zgui_viewer_mod.addImport("progress", core_progress_mod);
 
     const zgui_exe = b.addExecutable(.{
         .name = "raw-zgui-viewer",

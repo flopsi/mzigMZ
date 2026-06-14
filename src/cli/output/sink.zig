@@ -17,7 +17,7 @@ pub const OutputSink = struct {
 
     /// Creates a sink that writes to `path`, creating or truncating the file.
     pub fn init_file(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !OutputSink {
-        const file = try std.Io.Dir.createFile(.cwd(), io, path, .{});
+        const file = try std.Io.Dir.cwd().createFile(io, path, .{});
         return .{
             .io = io,
             .allocator = allocator,
@@ -57,12 +57,12 @@ test "file sink writes and closes" {
     }
 
     {
-        const file = try std.Io.Dir.openFile(.cwd(), io, path, .{});
+        const file = try std.Io.Dir.cwd().openFile(io, path, .{});
         defer file.close(io);
         var buf: [64]u8 = undefined;
         const n = try file.readPositionalAll(io, &buf, 0);
         try std.testing.expectEqualStrings("hello world", buf[0..n]);
     }
 
-    try std.Io.Dir.deleteFile(.cwd(), io, path);
+    try std.Io.Dir.cwd().deleteFile(io, path);
 }
