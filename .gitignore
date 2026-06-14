@@ -56,6 +56,6 @@ tests/ground_truth/
 # Agent-internal files (not for public repo)
 /.pi/
 /.claude/
-/AGENTS.md
-/LANGUAGE.md
-/CONTEXT.md
+AGENTS.md
+LANGUAGE.md
+CONTEXT.md
