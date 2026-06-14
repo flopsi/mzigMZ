@@ -35,12 +35,7 @@ pub fn build(b: *std.Build) void {
     spectrum_pool_mod.addImport("advanced_packet", packet_mod);
 
     // ---- raw_core/raw_file module -----------------------------------------
-    // PUBLISHED MODULE — consumed by the sibling `msViewer` repo via a
-    // build.zig.zon path dependency: dep.module("raw_file").
-    // DO NOT downgrade to b.createModule: that would silently break the
-    // msViewer link (path deps can only see modules published via addModule).
-    // See AGENTS.md § "Published modules (msViewer link)".
-    const raw_file_mod = b.addModule("raw_file", .{
+    const raw_file_mod = b.createModule(.{
         .root_source_file = b.path("src/raw_core/raw_file.zig"),
         .target = target,
         .optimize = optimize,
@@ -211,11 +206,7 @@ pub fn build(b: *std.Build) void {
     view_state_mod.addImport("advanced_packet", packet_mod);
 
     // ---- scan_decoder module -----------------------------------------
-    // PUBLISHED MODULE — DO NOT downgrade to b.createModule: that would
-    // silently break the msViewer link (path deps can only see modules
-    // published via addModule). See AGENTS.md § "Published modules (msViewer
-    // link)". Added for Issue 17: msViewer needs the spectrum packet decoder.
-    const scan_decoder_mod = b.addModule("scan_decoder", .{
+    const scan_decoder_mod = b.createModule(.{
         .root_source_file = b.path("src/scan_decoder.zig"),
         .target = target,
         .optimize = optimize,
@@ -549,11 +540,8 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the Win32 viewer");
     run_step.dependOn(&run_cmd.step);
 
-    // PUBLISHED MODULE — consumed by the sibling `msViewer` repo via a
-    // build.zig.zon path dependency: dep.module("plot_math").
-    // DO NOT downgrade to b.createModule (see note on raw_file_mod above and
-    // AGENTS.md § "Published modules (msViewer link)").
-    const plot_math_mod = b.addModule("plot_math", .{
+    // ---- viewer/plot_math module ----------------------------------------
+    const plot_math_mod = b.createModule(.{
         .root_source_file = b.path("src/viewer/plot_math.zig"),
         .target = target,
         .optimize = optimize,

@@ -112,10 +112,13 @@ XIC-style data: `[]f64` retention times + `[]f64` TIC or base peak intensity, `[
 ### Export Pipeline
 
 **Export module**
-Shared export pipeline in `src/export/`. All format writers consume a decoded `Spectrum` (m/z + intensity + PeakFeatures + bounds) and scan metadata (RT, MS level, filter string) from the existing decode pipeline. One decode, many outputs — no duplication.
+Current active export paths are deliberately separate:
+- `src/mzml/streaming_convert.zig` is the active `.raw` → mzML streaming path used by the CLI/viewer export path. It reads one scan at a time and writes XML directly to a buffered file writer.
+- `src/export/raw_file_writer.zig` is the `.raw` passthrough path. It preserves unknown byte regions verbatim and re-encodes packet data only when schema detection allows it.
+- `src/core/converter.zig` is a legacy IR bridge and is not the active mzML streaming path.
 
 **raw_file_writer.zig**
-Writes `.raw` files from decoded spectra + scan table. For pure passthrough (round 1): copies unknown byte regions verbatim from the source mmap, re-encodes only the scan table and packet data from decoded state. See ADR-0001.
+Writes a `.raw` passthrough copy. Fast path: for known schemas, bulk-copy the pre-scan-table, packet, and trailer regions, then overwrite scan-table entries and re-encoded centroid packets in-place. Slow path: per-scan decode+encode fallback. Unknown regions are preserved byte-for-byte. See ADR-0001 and ADR-0002.
 
 **Schema**
 A description of a known `.raw` file layout: `file_revision` + scan index entry size + packet header layout + checksum formula. For a known schema, the scan table offset, packet region bounds, and per-entry layout are fixed, enabling bulk copy operations. Schemas are validated by inspecting the first 10–20 scans. See ADR-0002.
@@ -142,15 +145,17 @@ Reverse of the centroid decoder. Takes decoded `mz[]`, `intensity[]`, optional `
 - The encoder always produces single-segment packets; multi-segment original packets are flattened into one segment on re-encode. This is valid but changes the on-disk byte layout.
 
 **mzml_writer.zig** (`src/mzml/writer.zig`)
-Streaming XML serializer: accumulates mzML document in a growable ArrayList buffer. Supports no/zlib/numpress compression, f32/f64 precision, indexed mzML with SHA-1 checksums. Writes spectra from SoA data (no AoS conversion) for the fast path. Verified on 275k-scan Astral files (11.6 GB output).
+Buffered XML serializer. It accumulates the mzML document in a growable `ArrayList`, supports no/zlib/numpress compression, f32/f64 precision, and indexed mzML with SHA-1 checksums. The active large-file `.raw` → mzML path is `mzml/streaming_convert.zig`, which avoids building the full document in memory.
 
 **Export pipeline architecture**
 ```
 RawFile (mmap) → ScanDecoder.decode() → Spectrum
     ↓
-    ├── raw_file_writer.zig   (.raw passthrough or modified)
-    └── mzml_writer.zig       (.mzML XML)
+    ├── mzml/streaming_convert.zig   (.raw → mzML, streaming)
+    └── export/raw_file_writer.zig   (.raw passthrough, fast/slow path)
 ```
+
+`raw_writer/writer.zig` is separate: it creates de-novo centroid-only `.raw` files from scratch and is not the passthrough path.
 
 **Progress reporting**
 Long-running exports (`raw_file_writer.passthrough`, `mzml/streaming_convert`) accept an optional `core.progress.Reporter`. The reporter is a type-erased `(current, total)` callback used by the imguinz2 viewer's export modal to update a progress bar without coupling the core export modules to the UI. Existing CLI tools and tests call the wrapper entry points with no reporter.
@@ -158,13 +163,13 @@ Long-running exports (`raw_file_writer.passthrough`, `mzml/streaming_convert`) a
 ### GUI Display Layer
 
 **Win32 GDI viewer** (`src/gui/`, legacy fallback)
-Retained as a buildable reference. Five modules: main_window, spectrum_canvas, chromatogram_canvas, scan_list, file_dialog. Uses `src/viewer/plot_math.zig` for coordinate mapping. This is the **positive control** — the imguinz2 viewer is validated by working first here, then porting.
+Retained as a buildable reference/positive control. Five modules: main_window, spectrum_canvas, chromatogram_canvas, scan_list, file_dialog. Uses `src/viewer/plot_math.zig` for coordinate mapping. It is not the active development target.
 
 **imguinz2 viewer** (`src/viewer_zgui/`, current dev target)
-The new GPU-accelerated viewer using imguinz2 (GLFW + OpenGL3 + ImGui + ImPlot via the `dear_bindings` dcimgui wrapper). Same 4-region layout as the Win32 viewer (sidebar / chromatogram / spectrum / status bar), with a 1:1 module-per-panel architecture: main, scan_list_panel, spectrum_plot, chromatogram_plot, file_dialog, cycle_navigation, export_panel. All UI state is owned by a single `ViewerState` struct in `main.zig`; each panel owns a small `State` struct for its persisted view state. The export panel drives async `.raw`/mzML exports and reports progress through `core.progress.Reporter`. Built and verified with real .raw data 2026-06-12 — see `D:/tmp/mzigRead/HANDOFF-imguinz2-real-data.md` for the full handoff.
+The new GPU-accelerated viewer using imguinz2 (GLFW + OpenGL3 + ImGui + ImPlot via the `dear_bindings` dcimgui wrapper). Same 4-region layout as the Win32 viewer (sidebar / chromatogram / spectrum / status bar), with a 1:1 module-per-panel architecture: main, scan_list_panel, spectrum_plot, chromatogram_plot, file_dialog, cycle_navigation, export_panel. All UI state is owned by a single `ViewerState` struct in `main.zig`; each panel owns a small `State` struct for its persisted view state. The export panel drives async `.raw`/mzML exports and reports progress through `core.progress.Reporter`. Built and verified with real .raw data 2026-06-12.
 
 **Pure-logic modules** (`src/viewer/`)
-Shared by both viewers. `plot_math.zig` (coordinate mapping + ZoomState). No allocation, no I/O, no GUI framework dependency.
+Legacy GDI viewer support. `plot_math.zig` (coordinate mapping + ZoomState). No allocation, no I/O, no GUI framework dependency.
 
 ### Application
 
@@ -195,16 +200,17 @@ Rendering style for spectrum peaks: `.stick` (vertical bars) or `.line` (connect
 | `scan_decoder.zig` | Decode pipeline (header → dispatch → SIMD bounds) |
 | `app_state.zig` | Viewer state: open file, current scan, zoom, chromatograms (no global singleton) |
 | `core/progress.zig` | Type-erased progress `Reporter` for long-running exports |
-| `export/raw_file_writer.zig` | .raw passthrough writer (scan table + packet re-encode, unknown regions verbatim; fast-path for known schemas, slow-path fallback) |
-| `src/mzml/writer.zig` | Streaming mzML XML serializer (functional, verified on 275k-scan files) |
+| `export/raw_file_writer.zig` | `.raw` passthrough writer; fast-path bulk copy + slow-path decode/encode fallback; unknown regions verbatim |
+| `mzml/streaming_convert.zig` | Active streaming `.raw` → mzML converter |
+| `src/mzml/writer.zig` | Buffered mzML XML serializer for full-buffer/test/legacy use |
 | `tools/check_checksum.zig` | Verify Adler32 checksum at offset 148 (Spectronaut compatibility) |
 | `tools/dump_packet_header.zig` | Diagnostic: dump 32-byte packet header for a given scan |
 | `tools/verify_profile.zig` | Profile encoder round-trip harness |
 | `tools/verify_passthrough.zig` | Passthrough writer + verify-passthrough harness |
 | `tools/passthrough.zig` | Passthrough writer (write-only, no verification) |
-| `gui/` (main_window.zig, spectrum_canvas.zig, chromatogram_canvas.zig, scan_list.zig, file_dialog.zig) | Win32 GDI viewer (legacy fallback) |
-| `viewer_zgui/` (main.zig, scan_list_panel.zig, spectrum_plot.zig, chromatogram_plot.zig, file_dialog.zig, cycle_navigation.zig, export_panel.zig) | imguinz2 viewer (current dev target) — see HANDOFF-imguinz2-real-data.md |
-| `viewer/plot_math.zig` | Pure coordinate-mapping functions (shared by both viewers) |
+| `gui/` (main_window.zig, spectrum_canvas.zig, chromatogram_canvas.zig, scan_list.zig, file_dialog.zig) | Win32 GDI viewer (legacy fallback/positive control) |
+| `viewer_zgui/` (main.zig, scan_list_panel.zig, spectrum_plot.zig, chromatogram_plot.zig, file_dialog.zig, cycle_navigation.zig, export_panel.zig) | imguinz2 viewer (current in-tree dev target) |
+| `viewer/plot_math.zig` | Pure coordinate-mapping functions for the legacy GDI viewer |
 
 ## Ground Truth / Verification
 
@@ -212,8 +218,10 @@ Rendering style for spectrum peaks: `.stick` (vertical bars) or `.line` (connect
 - **No synthetic spectra, ever.** Tests, verifications, and ground-truth comparisons must use real Thermo `.raw` files. Synthetic input (hand-crafted mz/intensity arrays, fake packet headers, made-up scan tables) hides bugs because the synthetic structure is always simpler than reality. The Astral benchmark (8.6 GB, 275,462 scans) and the 12k-scan LC-MS/MS files in `D:/000projects/test_files/` are the canonical inputs. If a test needs a "spectrum", it must `RawFile.open()` one and decode it. There is no exception.
 - Test files in `D:/000projects/test_files/` (12k-scan files, large Astral files).
 - Architecture reports in `D:/tmp/mzigRead/`.
+- Active planning/refactor documents in `D:/tmp/mzigRead/`: `CHECKLIST.md`, `GOTCHAS.md`, `LANGUAGE.md`, `synthesized-refactor-plan.md`, and `thermo-source-refactor-plan.md`. Superseded analysis reports are archived under `D:/tmp/mzigRead/archive/`.
 - Architecture decisions in `docs/adr/`.
 - Decompiled Thermo DLLs and JSON mappings in `D:/000projects/thermo/` (FileIoStructs for binary layout reference).
+- **No active external module contract:** `msViewer` is inactive. `raw_file`, `scan_decoder`, and `plot_math` are internal `b.createModule` modules only; do not preserve or add `b.addModule` names unless a new downstream contract is explicitly created.
 - Legacy writer reference: `D:/000projects/mzigWrite/src/roundtrip_raw.zig` — passthrough mode copies profile packets verbatim and bulk-copies the packet region. Architectural inspiration for the fast path (see ADR-0002).
 - The 8.6 GB Astral file (275,462 scans) parses in ~1s with 0 mismatches.
 - Passthrough verification: re-read + compare all scans against original, open in Spectronaut.

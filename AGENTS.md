@@ -17,9 +17,9 @@ An **all-in-one MS data-analysis platform** spanning the full workflow:
 4. **Visualization & statistics** — interactive plots of real data, plus import of
    Spectronaut and DIA-NN results for downstream analysis.
 
-A 20-year vision in the field, now buildable with agentic coding. The layered
-stack: **Reader (mzigRead)** → **Compute (spectrum_utils)** → **Analysis (KMD /
-de-novo)** → **App (msViewer: Zig + Clay + sokol_gfx, native + WASM)**.
+A 20-year vision in the field, now buildable with agentic coding. The current
+layered stack is: **Reader (mzigRead)** → **Compute (spectrum_utils)** →
+**Analysis (KMD / de-novo)** → **App (in-tree viewer + future native/WASM UI)**.
 
 > **North-star rule:** every decision in this project is checked against the
 > Vision and the Dream. If a change does not move us toward (or protect) them,
@@ -73,20 +73,20 @@ src/
 │   ├── packet_header.zig
 │   ├── filter_string.zig            (filter string grammar — activation types, MS levels)
 │   └── scan_index.zig
-├── core/                           (unified intermediate representation + shared helpers)
+├── core/                           (legacy IR bridge + shared helpers)
 │   ├── types.zig                   (MsRun, Scan, Precursor, CVParam — format-agnostic)
-│   ├── converter.zig               (AppState → MsRun bridge)
+│   ├── converter.zig               (legacy AppState → MsRun bridge; not the active mzML path)
 │   ├── instrument_utils.zig        (mass analyzer inference from filter strings + packet types)
 │   └── progress.zig                (type-erased progress Reporter for long-running exports)
 ├── export/                         (format writers — shared Spectrum input)
-│   └── raw_file_writer.zig         (.raw passthrough + modified export)
+│   └── raw_file_writer.zig         (.raw passthrough; unknown regions preserved verbatim)
 ├── mzml/                           (mzML format export)
 │   ├── types.zig                   (mzML-specific Spectrum, RunInfo, InstrumentConfiguration)
-│   ├── cv.zig                      (PSI-MS controlled vocabulary, comptime lookup)
+│   ├── cv.zig                      (PSI-MS controlled vocabulary lookup)
 │   ├── base64.zig                  (base64 encode/decode, little-endian mzML compliance)
 │   ├── numpress.zig                (MS-Numpress linear/PIC/SLOF compression)
-│   ├── writer.zig                  (streaming XML serializer, indexed mzML)
-│   └── streaming_convert.zig       (end-to-end .raw → mzML streaming converter)
+│   ├── writer.zig                  (buffered XML serializer; tests/legacy/full-buffer path)
+│   └── streaming_convert.zig       (active end-to-end .raw → mzML streaming converter)
 ├── raw_writer/                     (de-novo .raw file creation)
 │   └── writer.zig                  (RawFileWriter state machine: init → addScan → finalize)
 ├── gui/                            (Win32 GDI viewer — retained, not active dev target)
@@ -96,9 +96,9 @@ src/
 │   ├── scan_list.zig              (scan listbox)
 │   ├── file_dialog.zig            (GetOpenFileName wrapper)
 │   └── win32_common.zig           (Win32 API helpers)
-├── viewer/                         (pure-logic modules used by GUI — no Win32 dep)
+├── viewer/                         (legacy pure plot math for GDI viewer)
 │   └── plot_math.zig               (coordinate mapping, ZoomState — pure)
-├── viewer_zgui/                    (imguinz2 viewer — current dev target, NOT consumed by msViewer)
+├── viewer_zgui/                    (imguinz2 viewer — current in-tree dev target)
 │   ├── main.zig                    (entry, layout, menu, status bar, file dialog wiring; owns ViewerState)
 │   ├── scan_list_panel.zig         (ImGui table over file_state.ScanInfo)
 │   ├── spectrum_plot.zig           (ImPlot wrapper for *advanced.Spectrum, owns f64 mirror + State)
@@ -135,14 +135,11 @@ tests/                              (repo-root integration harness)
 └── ground_truth/                   (ground-truth fixtures)
 ```
 
-> NOTE: The legacy Win32 GDI viewer (`src/gui/`) is retained as a fallback.
-A separate GPU-based viewer (Clay layout + sokol_gfx rendering, native + WASM)
-is planned in the sibling repo `D:/000projects/msViewer/`. The pure-logic
-`src/viewer/` modules are the intended migration seam. The in-tree imguinz2
-viewer (`src/viewer_zgui/`) is an **interim** target — verified end-to-end with
-real data 2026-06-12 — that exercises the data layer (AppState, FileState,
-ScanDecoder) before the sibling repo's GPU viewer is built on top of it. See
-`D:/tmp/mzigRead/HANDOFF-imguinz2-real-data.md` for status.
+> NOTE: The legacy Win32 GDI viewer (`src/gui/`) is retained as a fallback/positive control.
+The in-tree imguinz2 viewer (`src/viewer_zgui/`) is the current dev target —
+verified end-to-end with real data 2026-06-12 — and exercises the data layer
+(AppState, FileState, ScanDecoder). There is no active sibling msViewer link or
+published-module contract to preserve.
 
 ## Project Root Hygiene
 
@@ -163,7 +160,7 @@ stale planning docs from being mistaken for active project context.
   - `0002-schema-based-fast-path.md` — fast-path/slow-path for known vs unknown file layouts
   - `0003-declarative-structural-spec.md` — declarative `src/spec/` binary-layout specs
   - `0004-pivot-to-gdi-viewer.md` — Win32 GDI viewer as active front-end (superseded)
-- **Planning & analysis**: `D:/tmp/mzigRead/` — CHECKLIST.md, GOTCHAS.md, LANGUAGE.md, REFACTOR_PLAN.md, handoff docs, PRDs, validation reports
+- **Planning & analysis**: `D:/tmp/mzigRead/` — CHECKLIST.md, GOTCHAS.md, LANGUAGE.md, `synthesized-refactor-plan.md`, `thermo-source-refactor-plan.md`, handoff docs, PRDs, validation reports; superseded analysis reports live under `archive/`.
 - **Decompiled reference**: `D:/000projects/thermo/` — Thermo DLLs (FileIoStructs for binary layout)
 
 
@@ -171,37 +168,20 @@ stale planning docs from being mistaken for active project context.
 - Language: Zig 0.16
 - Build System: `zig build`
 - Zig standard library `D:\000projects\mzigRead\.pi\skills\zig-quality\sources\std`
-- imguinz2 (vendored) — GLFW + OpenGL3 + ImGui + ImPlot via `dear_bindings` (dcimgui). The imguinz2 vendor path is `D:\000projects\mzigRead\zig-pkg\imguinz2-...\` and is **invoked** by `zig build run-zgui`. It is **not** a published module; the imguinz2 viewer (`src/viewer_zgui/`) is an in-tree dev target and is **not** consumed by msViewer (msViewer uses its own GPU stack).
+- imguinz2 (vendored) — GLFW + OpenGL3 + ImGui + ImPlot via `dear_bindings` (dcimgui). The imguinz2 vendor path is `D:\000projects\mzigRead\zig-pkg\imguinz2-...\` and is **invoked** by `zig build run-zgui`. The imguinz2 viewer (`src/viewer_zgui/`) is an in-tree dev target, not a published module.
+- **No active external module contract:** `raw_file`, `scan_decoder`, and `plot_math` are internal build modules only (`b.createModule`). Do not rely on `b.addModule` names unless a new explicit downstream contract is created.
 - **Two viewers, one data layer:**
   - `raw-orbitrap-viewer` (Win32 GDI, legacy/positive control) — `zig build run`
   - `raw-zgui-viewer` (imguinz2/GLFW+OpenGL3, current dev target) — `zig build run-zgui`
 
-## Published modules (msViewer link) — DO NOT BREAK
+## Published modules
 
-> **Note (2026-06-14):** The sibling `msViewer` repo is considered **legacy**
-> and will be decoupled/replaced. The modules below remain published in
-> `build.zig` so any future consumer can use them, but active development of the
-> imguinz2 viewer now lives in-tree in `src/viewer_zgui/`.
+No modules are published for external consumption. The old `msViewer` path-dependency
+contract is inactive; `raw_file`, `scan_decoder`, and `plot_math` are wired through
+`b.createModule` for internal use only.
 
-The sibling repo `D:/000projects/msViewer/` consumes this reader as a
-`build.zig.zon` **path dependency** (single source of truth — no copied files).
-That link works ONLY because `build.zig` publishes these modules via
-`b.addModule(...)`:
-
-| Published module | Source file | Why msViewer needs it |
-|------------------|-------------|-----------------------|
-| `raw_file`  | `src/raw_core/raw_file.zig` | mmap reader, `ScanIndexEntry` (tic/base_peak/rt), `ScanEvent` (ms_order), `ScanEventInfo`, `Reaction`. Transitively pulls the `spec/*` layer. |
-| `plot_math` | `src/viewer/plot_math.zig`  | pure coordinate mapping / `ZoomState` for plots (no Win32 dep). |
-| `scan_decoder` | `src/scan_decoder.zig` | spectrum packet decoder — msViewer uses it to decode and plot the selected scan (Issue 17). Pulls `advanced_packet` + `profile_packet` + `trailer_events` + `spectrum_pool`. |
-
-**Breakage rule:** Never downgrade these three from `b.addModule` back to
-`b.createModule`, never rename the published names (`"raw_file"`, `"plot_math"`),
-and never move the source files without updating msViewer's `build.zig`. A path
-dependency can only see modules published with `addModule`; a private
-`createModule` is invisible across repos and breaks msViewer **silently** (it
-still builds here). The `build.zig` call sites carry matching
-`PUBLISHED MODULE — DO NOT downgrade` comments. If you add new reader
-capabilities msViewer needs, publish them the same way and add a row here.
+If a future repo needs a stable API, add it deliberately and document the public
+surface in this file and in the downstream consumer's `build.zig`.
 
 ## Key Conventions
 
@@ -220,7 +200,7 @@ capabilities msViewer needs, publish them the same way and add a row here.
 - **"scan"** = a row in the scan index; **"packet"** = the binary record containing spectrum data. Do not interchange.
 - **"trailer"** = offset-based key-value pairs per scan; **"ScanEvent"** = the per-scan event table at file end. Different structures.
 - **"schema"** = a known `.raw` file layout (file revision + scan index size + packet header layout + checksum formula). Files matching a known schema can use the fast-path passthrough; others fall back to the slow path. See ADR-0002.
-- **Supported `.raw` revisions:** The reader accepts files with `file_revision >= 65`. Fast-path schema detection is active for revisions **65–66**; newer revisions fall back to the slow decode+encode path. Legacy revisions `< 65` are rejected at open time. See `docs/raw-version-mapping.md` for the full revision support table.
+- **Supported `.raw` revisions:** The reader accepts files with `file_revision >= 65`. Fast-path schema detection is active for revisions **65–66**; newer revisions fall back to the slow decode+encode path. Legacy revisions `< 65` are rejected at open time. See `D:/tmp/mzigRead/raw-version-mapping.md` for the full revision support table.
 - **"fast path"** = bulk `writeAll` of the pre-scan-table, packet, and trailer regions for known-schema files. 5–20× faster than per-scan decode+encode.
 - **"slow path"** = per-scan decode+encode for unknown-schema files. Correct but slow.
 - Ground truth: decode output must match ThermoRawFileParser (.NET) for the same scan.
@@ -294,14 +274,11 @@ parse this string, so it must be present and correct in mzML exports.
 The string is built from the per-scan `ScanEvent` table
 (`src/raw_core/scan_event.zig`) and stored on
 `file_state.ScanInfo.filter_string` when a file is loaded
-(`src/file_state.zig`). It is then carried through the core IR
-(`src/core/converter.zig` → `core.Scan.filter_string`) and emitted by both
-mzML writers:
+(`src/file_state.zig`). It is then carried by the active export paths and emitted
+by mzML writers:
 
-- Non-streaming: `src/mzml/writer.zig` writes `MS:1000512 filter string`.
-- Streaming: `src/mzml/streaming_convert.zig` already consumed the string for
-  analyzer/activation/source inference; the fix was to actually populate and
-  forward it.
+- Streaming: `src/mzml/streaming_convert.zig` consumes it for analyzer/activation/source inference and writes `MS:1000512 filter string`.
+- Buffered: `src/mzml/writer.zig` can also write `MS:1000512 filter string` when used by a caller.
 
 ### Why it was missing
 

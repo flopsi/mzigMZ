@@ -24,6 +24,7 @@ Thumbs.db
 # User data
 fixtures/
 data/
+docs/
 
 # Generated test artifacts
 tests/ground_truth/
@@ -50,6 +51,7 @@ tests/ground_truth/
 
 # Docs (all generated/agent-assisted)
 /docs/
+/drawings/
 
 # Agent-internal files (not for public repo)
 /.pi/
