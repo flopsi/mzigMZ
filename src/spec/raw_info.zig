@@ -8,6 +8,9 @@ pub const Layout = struct {
     controller_size: u32,
     controller_type: u32,
     controller_offset: u32,
+    /// Total size of the RawInfo / controller table region.
+    /// Verified from decompiled ThermoFisher.CommonCore.RawFileReader (RawInfo struct ~1024 bytes).
+    struct_size: u64,
 };
 
 /// Current layout for file rev >= 65.
@@ -17,6 +20,7 @@ pub const CURRENT = Layout{
     .controller_size = 16,
     .controller_type = 0,
     .controller_offset = 8,
+    .struct_size = 1024,
 };
 
 /// Virtual device type constant for MS controller.
@@ -30,4 +34,5 @@ test "raw info layout offsets are non-zero" {
     try std.testing.expect(CURRENT.num_controllers > 0);
     try std.testing.expect(CURRENT.controller_table > CURRENT.num_controllers);
     try std.testing.expect(CURRENT.controller_size > 0);
+    try std.testing.expect(CURRENT.struct_size > CURRENT.controller_table);
 }

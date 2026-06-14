@@ -254,17 +254,26 @@ pub const FileState = struct {
         const num_scans = rf.num_scans;
         const rev = rf.file_revision;
 
-        const trailer_pos_i64 = raw.readI64Mm(mm.memory, controller_offset + raw.RUN_HEADER_TRAILER_SCAN_EVENTS_POS) catch |err| {
+        const trailer_read_offset = std.math.add(u64, controller_offset, @as(u64, raw.RUN_HEADER_TRAILER_SCAN_EVENTS_POS)) catch {
+            std.log.warn("Trailer read offset overflows, using heuristic MS levels", .{});
+            self.applyHeuristicMsLevels();
+            return;
+        };
+        const trailer_pos_i64 = raw.readI64Mm(mm.memory, trailer_read_offset) catch |err| {
             std.log.warn("Failed to read trailer position: {s}, using heuristic MS levels", .{@errorName(err)});
             self.applyHeuristicMsLevels();
             return;
         };
-        if (trailer_pos_i64 <= 0) {
+        const trailer_pos: u64 = std.math.cast(u64, trailer_pos_i64) orelse {
             std.log.warn("Invalid trailer position {}, using heuristic MS levels", .{trailer_pos_i64});
             self.applyHeuristicMsLevels();
             return;
+        };
+        if (trailer_pos == 0) {
+            std.log.warn("Invalid trailer position 0, using heuristic MS levels", .{});
+            self.applyHeuristicMsLevels();
+            return;
         }
-        const trailer_pos: u64 = @intCast(trailer_pos_i64);
 
         const trailers = trailer_events.parse_trailer_scan_events(
             self.allocator,

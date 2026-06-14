@@ -4,6 +4,7 @@ const std = @import("std");
 const raw = @import("raw_file");
 const checksum = @import("checksum");
 const cli = @import("cli_args");
+const spec_file_header = @import("spec/file_header");
 
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
@@ -22,15 +23,15 @@ pub fn main(init: std.process.Init) !void {
 
     const path = args[1];
 
-    const file = try std.Io.Dir.cwd().open_file(io, path, .{ .mode = .read_write });
+    const file = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
     defer file.close(io);
 
     const stat = try file.stat(io);
     const file_length = stat.size;
     var rev_buf: [2]u8 = undefined;
-    _ = try file.readPositionalAll(io, &rev_buf, 36);
+    _ = try file.readPositionalAll(io, &rev_buf, spec_file_header.FILE_REV_OFFSET);
     const file_rev = std.mem.readInt(u16, &rev_buf, .little);
-    const header_size: usize = 1356;
+    const header_size: usize = std.math.cast(usize, spec_file_header.FILE_HEADER_SIZE) orelse return error.FileTooLarge;
 
     const stored = try checksum.read_stored_checksum(file, io);
     const computed = try checksum.compute_raw_checksum(allocator, file, io, file_rev, header_size, file_length);

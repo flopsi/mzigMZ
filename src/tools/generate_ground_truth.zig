@@ -100,7 +100,7 @@ fn parseMgfStream(
     out_dir: []const u8,
 ) !usize {
     const cwd = std.Io.Dir.cwd();
-    const file = try cwd.open_file(io, mgf_path, .{});
+    const file = try cwd.openFile(io, mgf_path, .{});
     defer file.close(io);
 
     var in_block = false;

@@ -4,6 +4,12 @@ const raw = @import("raw_file");
 const wp = @import("writer_primitives");
 const scan_event = @import("scan_event");
 const advanced_packet = @import("advanced_packet");
+const spec_file_header = @import("spec/file_header");
+const spec_raw_info = @import("spec/raw_info");
+const spec_run_header = @import("spec/run_header");
+
+/// File revision produced by this de-novo writer. Currently hard-coded to rev 66.
+pub const target_file_revision = 66;
 
 pub const RawWriterError = error{
     NoScans,
@@ -114,8 +120,8 @@ pub const RawFileWriter = struct {
             .file = file,
             .io = io,
             .allocator = allocator,
-            .file_header_size = 536,
-            .file_revision = 66,
+            .file_header_size = spec_file_header.FILE_HEADER_SIZE,
+            .file_revision = target_file_revision,
             .sequence_row_offset = 0,
             .raw_info_offset = 0,
             .run_header_offset = 0,
@@ -126,7 +132,6 @@ pub const RawFileWriter = struct {
             .state = .init,
         };
         try writer.writeFileHeaderPlaceholder();
-        writer.file_header_size = raw.FILE_HEADER_SIZE;
         writer.sequence_row_offset = writer.current_offset;
         try writer.writeMinimalSequenceRow();
         try writer.writeMinimalAutoSamplerConfig();
@@ -225,15 +230,15 @@ pub const RawFileWriter = struct {
     }
 
     fn writeFileHeaderPlaceholder(self: *RawFileWriter) !void {
-        var header: [1356]u8 = std.mem.zeroes([1356]u8);
+        var header: [spec_file_header.FILE_HEADER_SIZE]u8 = std.mem.zeroes([spec_file_header.FILE_HEADER_SIZE]u8);
         @memcpy(header[0..4], "RAW1");
-        std.mem.writeInt(u16, header[36..38], self.file_revision, .little);
+        std.mem.writeInt(u16, header[spec_file_header.FILE_REV_OFFSET..][0..2], self.file_revision, .little);
         try self.file.writePositionalAll(self.io, &header, 0);
         self.current_offset = header.len;
     }
 
     fn writeMinimalSequenceRow(self: *RawFileWriter) !void {
-        var base: [64]u8 = std.mem.zeroes([64]u8);
+        var base: [spec_file_header.SEQ_ROW_INFO_SIZE]u8 = std.mem.zeroes([spec_file_header.SEQ_ROW_INFO_SIZE]u8);
         try self.file.writePositionalAll(self.io, &base, self.current_offset);
         self.current_offset = std.math.add(u64, self.current_offset, base.len) catch return RawWriterError.OffsetOverflow;
         var i: usize = 0;
@@ -257,7 +262,7 @@ pub const RawFileWriter = struct {
     }
 
     fn writeMinimalAutoSamplerConfig(self: *RawFileWriter) !void {
-        var base: [24]u8 = std.mem.zeroes([24]u8);
+        var base: [spec_file_header.AUTO_SAMPLER_CONFIG_SIZE]u8 = std.mem.zeroes([spec_file_header.AUTO_SAMPLER_CONFIG_SIZE]u8);
         try self.file.writePositionalAll(self.io, &base, self.current_offset);
         self.current_offset = std.math.add(u64, self.current_offset, base.len) catch return RawWriterError.OffsetOverflow;
         try wp.write_i32_at(self.file, self.io, self.current_offset, 0);
@@ -265,32 +270,34 @@ pub const RawFileWriter = struct {
     }
 
     fn writeMinimalRawFileInfo(self: *RawFileWriter) !void {
-        var buf: [1024]u8 = std.mem.zeroes([1024]u8);
-        std.mem.writeInt(i32, buf[28..32], 1, .little);
-        std.mem.writeInt(i32, buf[816..820], raw.VIRTUAL_DEVICE_MS, .little);
-        std.mem.writeInt(i64, buf[824..832], 0, .little);
+        var buf: [spec_raw_info.CURRENT.struct_size]u8 = std.mem.zeroes([spec_raw_info.CURRENT.struct_size]u8);
+        std.mem.writeInt(i32, buf[spec_raw_info.CURRENT.num_controllers..][0..4], 1, .little);
+        const controller_type_offset = spec_raw_info.CURRENT.controller_table + spec_raw_info.CURRENT.controller_type;
+        const controller_offset_offset = spec_raw_info.CURRENT.controller_table + spec_raw_info.CURRENT.controller_offset;
+        std.mem.writeInt(i32, buf[controller_type_offset..][0..4], spec_raw_info.VIRTUAL_DEVICE_MS, .little);
+        std.mem.writeInt(i64, buf[controller_offset_offset..][0..8], 0, .little);
         try self.file.writePositionalAll(self.io, &buf, self.current_offset);
         self.current_offset = std.math.add(u64, self.current_offset, buf.len) catch return RawWriterError.OffsetOverflow;
     }
 
     fn writeRunHeaderPlaceholder(self: *RawFileWriter, first_scan_number: i32) !void {
-        var buf: [7576]u8 = std.mem.zeroes([7576]u8);
-        std.mem.writeInt(i32, buf[8..12], first_scan_number, .little);
-        std.mem.writeInt(i32, buf[12..16], first_scan_number, .little);
+        var buf: [spec_run_header.CURRENT.struct_size]u8 = std.mem.zeroes([spec_run_header.CURRENT.struct_size]u8);
+        std.mem.writeInt(i32, buf[spec_run_header.CURRENT.first_spectrum..][0..4], first_scan_number, .little);
+        std.mem.writeInt(i32, buf[spec_run_header.CURRENT.last_spectrum..][0..4], first_scan_number, .little);
         try self.file.writePositionalAll(self.io, &buf, self.current_offset);
         self.patches = .{
             .file_offset = self.current_offset,
-            .first_spectrum = std.math.add(u64, self.current_offset, 8) catch return RawWriterError.OffsetOverflow,
-            .last_spectrum = std.math.add(u64, self.current_offset, 12) catch return RawWriterError.OffsetOverflow,
-            .spectrum_pos = std.math.add(u64, self.current_offset, raw.RUN_HEADER_SPECT_POS) catch return RawWriterError.OffsetOverflow,
-            .packet_pos = std.math.add(u64, self.current_offset, raw.RUN_HEADER_PACKET_POS) catch return RawWriterError.OffsetOverflow,
-            .num_trailer_scan_events = std.math.add(u64, self.current_offset, raw.RUN_HEADER_NUM_TRAILER_SCAN_EVENTS) catch return RawWriterError.OffsetOverflow,
-            .trailer_scan_events_pos = std.math.add(u64, self.current_offset, raw.RUN_HEADER_TRAILER_SCAN_EVENTS_POS) catch return RawWriterError.OffsetOverflow,
+            .first_spectrum = std.math.add(u64, self.current_offset, spec_run_header.CURRENT.first_spectrum) catch return RawWriterError.OffsetOverflow,
+            .last_spectrum = std.math.add(u64, self.current_offset, spec_run_header.CURRENT.last_spectrum) catch return RawWriterError.OffsetOverflow,
+            .spectrum_pos = std.math.add(u64, self.current_offset, spec_run_header.CURRENT.spect_pos) catch return RawWriterError.OffsetOverflow,
+            .packet_pos = std.math.add(u64, self.current_offset, spec_run_header.CURRENT.packet_pos) catch return RawWriterError.OffsetOverflow,
+            .num_trailer_scan_events = std.math.add(u64, self.current_offset, spec_run_header.CURRENT.num_trailer_scan_events) catch return RawWriterError.OffsetOverflow,
+            .trailer_scan_events_pos = std.math.add(u64, self.current_offset, spec_run_header.CURRENT.trailer_scan_events_pos) catch return RawWriterError.OffsetOverflow,
         };
         self.current_offset = std.math.add(u64, self.current_offset, buf.len) catch return RawWriterError.OffsetOverflow;
         // self.run_header_offset is an internal u64 offset; writer controls file layout.
-        const run_header_ptr_offset = std.math.add(u64, self.raw_info_offset, raw.RAW_INFO_CONTROLLER_TABLE_CURRENT) catch return RawWriterError.OffsetOverflow;
-        const run_header_ptr_offset_plus_8 = std.math.add(u64, run_header_ptr_offset, 8) catch return RawWriterError.OffsetOverflow;
+        const run_header_ptr_offset = std.math.add(u64, self.raw_info_offset, spec_raw_info.CURRENT.controller_table) catch return RawWriterError.OffsetOverflow;
+        const run_header_ptr_offset_plus_8 = std.math.add(u64, run_header_ptr_offset, spec_raw_info.CURRENT.controller_offset) catch return RawWriterError.OffsetOverflow;
         // SAFETY: self.run_header_offset is an internal u64 offset produced by this writer and fits i64 for any realistic file.
         try wp.write_i64_at(self.file, self.io, run_header_ptr_offset_plus_8, @intCast(self.run_header_offset));
     }
@@ -411,7 +418,7 @@ pub const RawFileWriter = struct {
 };
 
 pub fn patch_checksum(allocator: std.mem.Allocator, path: []const u8, io: std.Io, file_rev: u16) Error!void {
-    const file = try std.Io.Dir.cwd().open_file(io, path, .{ .mode = .read_write });
+    const file = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
     defer file.close(io);
     const stat = try file.stat(io);
     try wp.write_checksum_at148(allocator, file, io, file_rev, stat.size);

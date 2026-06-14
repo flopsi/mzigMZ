@@ -24,9 +24,13 @@ Thumbs.db
 # User data
 fixtures/
 data/
+docs/
 
 # Generated test artifacts
 tests/ground_truth/
+
+# Agent worktrees
+.worktrees/
 
 # Agent skills — vendored stdlib snapshots and skill scaffolding
 .pi/skills/zig-quality/sources/
@@ -38,6 +42,7 @@ tests/ground_truth/
 /nul
 /*.exe
 /*.pdb
+/imgui.ini
 /zig-pkg/
 /.scratch/
 
@@ -46,6 +51,7 @@ tests/ground_truth/
 
 # Docs (all generated/agent-assisted)
 /docs/
+/drawings/
 
 # Agent-internal files (not for public repo)
 /.pi/

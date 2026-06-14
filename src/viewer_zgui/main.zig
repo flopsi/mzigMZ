@@ -16,6 +16,7 @@ const app = @import("appimgui");
 const ig = app.ig;
 const ip = @import("implot");
 const AppStateM = @import("app_state");
+const cli = @import("cli_args");
 
 const scan_list_panel = @import("scan_list_panel.zig");
 const spectrum_plot = @import("spectrum_plot.zig");
@@ -26,50 +27,59 @@ const export_panel = @import("export_panel.zig");
 
 // ── State ───────────────────────────────────────────────────────────────
 const ViewMode = enum { tic, bpc, scan };
-const CHROM_HEIGHT: f32 = 200; // height of the chromatogram strip at the top
-var show_sidebar: bool = true;
-var show_status: bool = true;
-var running: bool = true;
-var view_mode: ViewMode = .tic;
 
-// Two independently-navigated spectrum panels (only used in scan mode)
-var current_ms1_index: i32 = -1; // -1 = unselected
-var current_ms2_index: i32 = -1; // -1 = unselected
+pub const ViewerError = AppStateM.AppStateError || std.mem.Allocator.Error;
 
-var dbg_alloc: std.heap.DebugAllocator(.{}) = .init;
-const gpa: std.mem.Allocator = dbg_alloc.allocator();
-var state: *AppStateM.AppState = undefined;
+pub const ViewerState = struct {
+    show_sidebar: bool = true,
+    show_status: bool = true,
+    running: bool = true,
+    view_mode: ViewMode = .tic,
 
-var status_buf: [256]u8 = undefined;
-var export_state = export_panel.init();
+    // Two independently-navigated spectrum panels (only used in scan mode)
+    current_ms1_index: i32 = -1, // -1 = unselected
+    current_ms2_index: i32 = -1, // -1 = unselected
+
+    gpa: std.mem.Allocator = undefined,
+    app_state: *AppStateM.AppState = undefined,
+
+    status_buf: [256]u8 = undefined,
+    export_state: export_panel.ExportState = .{},
+
+    spectrum: spectrum_plot.State = .{},
+    chromatogram: chromatogram_plot.State = .{},
+    scan_list: scan_list_panel.State = .{},
+
+    window: app.Window = undefined,
+};
 
 // ── Independent MS1 / MS2 navigation (each panel has its own ←/→) ───────
-fn navPrevMs1() void {
-    const from = current_ms1_index;
-    if (findPrevMs1(state, from)) |i| {
-        current_ms1_index = @intCast(i);
-        state.load_scan(i) catch |err| std.log.warn("loadScan MS1 failed: {s}", .{@errorName(err)});
+fn navPrevMs1(vs: *ViewerState) void {
+    const from = vs.current_ms1_index;
+    if (findPrevMs1(vs.app_state, from)) |i| {
+        vs.current_ms1_index = @intCast(i);
+        vs.app_state.load_scan(i) catch |err| std.log.warn("loadScan MS1 failed: {s}", .{@errorName(err)});
     }
 }
-fn navNextMs1() void {
-    const from = current_ms1_index;
-    if (findNextMs1(state, from)) |i| {
-        current_ms1_index = @intCast(i);
-        state.load_scan(i) catch |err| std.log.warn("loadScan MS1 failed: {s}", .{@errorName(err)});
+fn navNextMs1(vs: *ViewerState) void {
+    const from = vs.current_ms1_index;
+    if (findNextMs1(vs.app_state, from)) |i| {
+        vs.current_ms1_index = @intCast(i);
+        vs.app_state.load_scan(i) catch |err| std.log.warn("loadScan MS1 failed: {s}", .{@errorName(err)});
     }
 }
-fn navPrevMs2() void {
-    const from = current_ms2_index;
-    if (findPrevMs2(state, from)) |i| {
-        current_ms2_index = @intCast(i);
-        state.load_scan(i) catch |err| std.log.warn("loadScan MS2 failed: {s}", .{@errorName(err)});
+fn navPrevMs2(vs: *ViewerState) void {
+    const from = vs.current_ms2_index;
+    if (findPrevMs2(vs.app_state, from)) |i| {
+        vs.current_ms2_index = @intCast(i);
+        vs.app_state.load_scan(i) catch |err| std.log.warn("loadScan MS2 failed: {s}", .{@errorName(err)});
     }
 }
-fn navNextMs2() void {
-    const from = current_ms2_index;
-    if (findNextMs2(state, from)) |i| {
-        current_ms2_index = @intCast(i);
-        state.load_scan(i) catch |err| std.log.warn("loadScan MS2 failed: {s}", .{@errorName(err)});
+fn navNextMs2(vs: *ViewerState) void {
+    const from = vs.current_ms2_index;
+    if (findNextMs2(vs.app_state, from)) |i| {
+        vs.current_ms2_index = @intCast(i);
+        vs.app_state.load_scan(i) catch |err| std.log.warn("loadScan MS2 failed: {s}", .{@errorName(err)});
     }
 }
 
@@ -109,146 +119,119 @@ fn findPrevMs2(s: *AppStateM.AppState, from: i32) ?usize {
     }
 }
 
-// ── Win32 argv parsing (Zig 0.16 has no argsAlloc) ─────────────────────
-const LPCWSTR = [*:0]const u16;
-extern "kernel32" fn GetCommandLineW() callconv(.winapi) LPCWSTR;
-extern "shell32" fn CommandLineToArgvW(lpCmdLine: LPCWSTR, pNumArgs: *i32) callconv(.winapi) ?[*]LPCWSTR;
-extern "kernel32" fn LocalFree(hMem: ?*anyopaque) callconv(.winapi) ?*anyopaque;
-
-fn utf16ZLen(s: [*:0]const u16) usize {
-    var n: usize = 0;
-    while (s[n] != 0) : (n += 1) {}
-    return n;
-}
-
-fn getOptionalFilePath() ?[]u8 {
-    var argc: i32 = 0;
-    const argv_w = CommandLineToArgvW(GetCommandLineW(), &argc) orelse return null;
-    defer _ = LocalFree(@ptrCast(argv_w));
-    if (argc < 2) return null;
-    const n = utf16ZLen(argv_w[1]);
-    return std.unicode.utf16LeToUtf8Alloc(gpa, argv_w[1][0..n]) catch null;
-}
-
 // ── File open flow (mirrors src/gui/main_window.zig handleFileOpen) ─────
-fn openRawFile(path: []const u8) void {
-    state.open_file(path) catch |err| {
-        std.log.warn("openFile failed: {s}", .{@errorName(err)});
-        return;
-    };
-    state.compute_chromatograms();
+fn openRawFile(vs: *ViewerState, path: []const u8) ViewerError!void {
+    try vs.app_state.open_file(path);
+    vs.app_state.compute_chromatograms();
     // Initial selection: first MS1, first MS2
-    current_ms1_index = if (findNextMs1(state, -1)) |i| @intCast(i) else -1;
-    current_ms2_index = if (findNextMs2(state, -1)) |i| @intCast(i) else -1;
+    vs.current_ms1_index = if (findNextMs1(vs.app_state, -1)) |i| @intCast(i) else -1;
+    vs.current_ms2_index = if (findNextMs2(vs.app_state, -1)) |i| @intCast(i) else -1;
 }
 
-fn promptAndOpenFile() void {
-    if (file_dialog.show_open_file_dialog(gpa)) |path| {
-        defer gpa.free(path);
-        openRawFile(path);
+fn promptAndOpenFile(vs: *ViewerState) ViewerError!void {
+    if (file_dialog.show_open_file_dialog(vs.gpa)) |path| {
+        defer vs.gpa.free(path);
+        try openRawFile(vs, path);
     }
 }
 
-fn promptExportRaw() void {
-    if (!state.has_file_open()) return;
-    if (file_dialog.show_save_file_dialog(gpa, "Export .raw", "RAW Files", "*.raw", "raw")) |path| {
-        defer gpa.free(path);
-        export_panel.start(&export_state, gpa, state, .raw, path) catch |err| {
-            std.log.warn("Export .raw failed to start: {s}", .{@errorName(err)});
-        };
+fn promptExportRaw(vs: *ViewerState) ViewerError!void {
+    if (!vs.app_state.has_file_open()) return;
+    if (file_dialog.show_save_file_dialog(vs.gpa, "Export .raw", "RAW Files", "*.raw", "raw")) |path| {
+        defer vs.gpa.free(path);
+        try export_panel.start(&vs.export_state, vs.gpa, vs.app_state, .raw, path);
         ig.ImGui_OpenPopup("Exporting...", ig.ImGuiPopupFlags_None);
     }
 }
 
-fn promptExportMzml() void {
-    if (!state.has_file_open()) return;
-    if (file_dialog.show_save_file_dialog(gpa, "Export mzML", "mzML Files", "*.mzML", "mzML")) |path| {
-        defer gpa.free(path);
-        export_panel.start(&export_state, gpa, state, .mzml, path) catch |err| {
-            std.log.warn("Export mzML failed to start: {s}", .{@errorName(err)});
-        };
+fn promptExportMzml(vs: *ViewerState) ViewerError!void {
+    if (!vs.app_state.has_file_open()) return;
+    if (file_dialog.show_save_file_dialog(vs.gpa, "Export mzML", "mzML Files", "*.mzML", "mzML")) |path| {
+        defer vs.gpa.free(path);
+        try export_panel.start(&vs.export_state, vs.gpa, vs.app_state, .mzml, path);
         ig.ImGui_OpenPopup("Exporting...", ig.ImGuiPopupFlags_None);
     }
 }
 
 /// Sidebar click: if user clicks an MS1, set as upper; if MS2, set as lower
 /// and auto-load the parent MS1 into upper. This is the only sync point.
-fn onScanSelected(scan_index: usize) void {
-    if (scan_index >= state.file.scans.len) return;
-    const scan = state.file.scans[scan_index];
+fn onScanSelected(context: ?*anyopaque, scan_index: usize) void {
+    const vs: *ViewerState = @ptrCast(@alignCast(context.?));
+    if (scan_index >= vs.app_state.file.scans.len) return;
+    const scan = vs.app_state.file.scans[scan_index];
     if (scan.ms_level == 1) {
-        current_ms1_index = @intCast(scan_index);
-        state.load_scan(scan_index) catch |err| std.log.warn("loadScan MS1 failed: {s}", .{@errorName(err)});
+        vs.current_ms1_index = @intCast(scan_index);
+        vs.app_state.load_scan(scan_index) catch |err| std.log.warn("loadScan MS1 failed: {s}", .{@errorName(err)});
     } else {
-        current_ms2_index = @intCast(scan_index);
-        if (cycle_nav.parent_ms1_index(state, scan_index)) |p| {
-            current_ms1_index = @intCast(p);
+        vs.current_ms2_index = @intCast(scan_index);
+        if (cycle_nav.parent_ms1_index(vs.app_state, scan_index)) |p| {
+            vs.current_ms1_index = @intCast(p);
         }
         // Load the MS2 spectrum (current_scan_index must equal scan_index for currentSpectrum to return the right one)
-        state.load_scan(scan_index) catch |err| std.log.warn("loadScan MS2 failed: {s}", .{@errorName(err)});
+        vs.app_state.load_scan(scan_index) catch |err| std.log.warn("loadScan MS2 failed: {s}", .{@errorName(err)});
     }
 }
 
 // ── UI: Status bar text ────────────────────────────────────────────────
-fn formatStatus() [*:0]const u8 {
-    const file = state.file.file_path orelse "No file loaded";
-    const n = state.file.scans.len;
-    const text = std.fmt.bufPrintZ(&status_buf, "{s} | {d} scans | rev {d}", .{
-        file, n, state.file.file_revision(),
-    }) catch &[_:0]u8{};
+fn formatStatus(vs: *ViewerState) [*:0]const u8 {
+    const file = vs.app_state.file.file_path orelse "No file loaded";
+    const n = vs.app_state.file.scans.len;
+    const text = std.fmt.bufPrintSentinel(&vs.status_buf, "{s} | {d} scans | rev {d}", .{
+        file, n, vs.app_state.file.file_revision(),
+    }, 0) catch &[_:0]u8{};
     return text;
 }
 
 // ── UI: Top toolbar (segmented control) ─────────────────────────────────
 const TOOLBAR_HEIGHT: f32 = 28;
 
-fn drawToolbar() void {
+fn drawToolbar(vs: *ViewerState) void {
     ig.ImGui_SetNextWindowPosEx(.{ .x = 0, .y = 0 }, ig.ImGuiCond_Always, .{ .x = 0, .y = 0 });
     ig.ImGui_SetNextWindowSize(.{ .x = -1, .y = TOOLBAR_HEIGHT }, ig.ImGuiCond_Always);
     if (ig.ImGui_Begin("Toolbar", null, ig.ImGuiWindowFlags_NoTitleBar | ig.ImGuiWindowFlags_NoResize |
         ig.ImGuiWindowFlags_NoMove | ig.ImGuiWindowFlags_NoScrollbar | ig.ImGuiWindowFlags_NoDocking))
     {
         defer ig.ImGui_End();
-        if (ig.ImGui_Button("Load File")) promptAndOpenFile();
+        if (ig.ImGui_Button("Load File")) promptAndOpenFile(vs) catch |err| std.log.warn("Open file failed: {s}", .{@errorName(err)});
         ig.ImGui_SameLine();
         ig.ImGui_Spacing();
         ig.ImGui_SameLine();
-        if (ig.ImGui_RadioButton("TIC", view_mode == .tic)) view_mode = .tic;
+        if (ig.ImGui_RadioButton("TIC", vs.view_mode == .tic)) vs.view_mode = .tic;
         ig.ImGui_SameLine();
-        if (ig.ImGui_RadioButton("BPC", view_mode == .bpc)) view_mode = .bpc;
+        if (ig.ImGui_RadioButton("BPC", vs.view_mode == .bpc)) vs.view_mode = .bpc;
         ig.ImGui_SameLine();
-        if (ig.ImGui_RadioButton("Scan", view_mode == .scan)) view_mode = .scan;
-        ig.ImGui_SameLine();
-        ig.ImGui_Spacing();
-        ig.ImGui_SameLine();
+        if (ig.ImGui_RadioButton("Scan", vs.view_mode == .scan)) vs.view_mode = .scan;
         ig.ImGui_SameLine();
         ig.ImGui_Spacing();
         ig.ImGui_SameLine();
-        if (ig.ImGui_Button("Export .raw")) promptExportRaw();
         ig.ImGui_SameLine();
-        if (ig.ImGui_Button("Export mzML")) promptExportMzml();
+        ig.ImGui_Spacing();
+        ig.ImGui_SameLine();
+        if (ig.ImGui_Button("Export .raw")) promptExportRaw(vs) catch |err| std.log.warn("Export .raw failed: {s}", .{@errorName(err)});
+        ig.ImGui_SameLine();
+        if (ig.ImGui_Button("Export mzML")) promptExportMzml(vs) catch |err| std.log.warn("Export mzML failed: {s}", .{@errorName(err)});
     }
 }
 
 // ── UI: Menu bar (legacy) ──────────────────────────────────────────────
-fn drawMenuBar() void {
+fn drawMenuBar(vs: *ViewerState) void {
     if (!ig.ImGui_BeginMainMenuBar()) return;
     defer ig.ImGui_EndMainMenuBar();
     if (ig.ImGui_BeginMenuEx("File", true)) {
         defer ig.ImGui_EndMenu();
-        if (ig.ImGui_MenuItemEx("Open .raw file...", "Ctrl+O", false, true)) promptAndOpenFile();
+        if (ig.ImGui_MenuItemEx("Open .raw file...", "Ctrl+O", false, true)) promptAndOpenFile(vs) catch |err| std.log.warn("Open file failed: {s}", .{@errorName(err)});
         ig.ImGui_Separator();
-        if (ig.ImGui_MenuItemEx("Exit", "Alt+F4", false, true)) running = false;
+        if (ig.ImGui_MenuItemEx("Exit", "Alt+F4", false, true)) vs.running = false;
     }
     if (ig.ImGui_BeginMenuEx("View", true)) {
         defer ig.ImGui_EndMenu();
-        _ = ig.ImGui_MenuItemBoolPtr("Sidebar", null, &show_sidebar, true);
-        _ = ig.ImGui_MenuItemBoolPtr("Status Bar", null, &show_status, true);
+        _ = ig.ImGui_MenuItemBoolPtr("Sidebar", null, &vs.show_sidebar, true);
+        _ = ig.ImGui_MenuItemBoolPtr("Status Bar", null, &vs.show_status, true);
     }
 }
 
 // ── Layout: compute regions from viewport ──────────────────────────────
-fn layoutRegions(vp_pos: ig.ImVec2, vp_sz: ig.ImVec2, top_h: f32) struct {
+fn layoutRegions(vs: *ViewerState, vp_pos: ig.ImVec2, vp_sz: ig.ImVec2, top_h: f32) struct {
     work_y: f32,
     work_h: f32,
     sidebar_x: f32,
@@ -256,10 +239,10 @@ fn layoutRegions(vp_pos: ig.ImVec2, vp_sz: ig.ImVec2, top_h: f32) struct {
     main_x: f32,
     main_w: f32,
 } {
-    const status_h: f32 = if (show_status) 24 else 0;
+    const status_h: f32 = if (vs.show_status) 24 else 0;
     const work_y = vp_pos.y + top_h;
     const work_h = vp_sz.y - top_h - status_h;
-    const sidebar_w: f32 = if (show_sidebar) @floor(vp_sz.x * 0.20) else 0;
+    const sidebar_w: f32 = if (vs.show_sidebar) @floor(vp_sz.x * 0.20) else 0;
     const main_x = vp_pos.x + sidebar_w;
     const main_w = vp_sz.x - sidebar_w;
     return .{
@@ -278,12 +261,12 @@ const STATUS_BAR_FLAGS: c_int = ig.ImGuiWindowFlags_NoTitleBar | ig.ImGuiWindowF
     ig.ImGuiWindowFlags_NoCollapse | ig.ImGuiWindowFlags_NoSavedSettings |
     ig.ImGuiWindowFlags_NoDocking | ig.ImGuiWindowFlags_NoScrollWithMouse;
 
-fn drawStatusBar(x: f32, y: f32, w: f32, h: f32) void {
+fn drawStatusBar(vs: *ViewerState, x: f32, y: f32, w: f32, h: f32) void {
     ig.ImGui_SetNextWindowPosEx(.{ .x = x, .y = y }, ig.ImGuiCond_Always, .{ .x = 0, .y = 0 });
     ig.ImGui_SetNextWindowSize(.{ .x = w, .y = h }, ig.ImGuiCond_Always);
     if (ig.ImGui_Begin("StatusBar", null, STATUS_BAR_FLAGS)) {
         defer ig.ImGui_End();
-        ig.ImGui_Text("%s", @as([*c]const u8, formatStatus()));
+        ig.ImGui_Text("%s", @as([*c]const u8, formatStatus(vs)));
     }
 }
 
@@ -292,7 +275,7 @@ const NAV_BAR_HEIGHT: f32 = 32;
 
 const NavKind = enum { ms1, ms2 };
 
-fn drawScanNavigator(id: [*:0]const u8, x: f32, y: f32, w: f32, h: f32, scan_index: i32, kind: NavKind) void {
+fn drawScanNavigator(vs: *ViewerState, id: [*:0]const u8, x: f32, y: f32, w: f32, h: f32, scan_index: i32, kind: NavKind) void {
     ig.ImGui_SetNextWindowPosEx(.{ .x = x, .y = y }, ig.ImGuiCond_Always, .{ .x = 0, .y = 0 });
     ig.ImGui_SetNextWindowSize(.{ .x = w, .y = h }, ig.ImGuiCond_Always);
     if (ig.ImGui_Begin(id, null, ig.ImGuiWindowFlags_NoTitleBar | ig.ImGuiWindowFlags_NoResize |
@@ -300,26 +283,26 @@ fn drawScanNavigator(id: [*:0]const u8, x: f32, y: f32, w: f32, h: f32, scan_ind
     {
         defer ig.ImGui_End();
         var label_buf: [32]u8 = undefined;
-        const label: [:0]const u8 = if (scan_index >= 0 and scan_index < state.file.scans.len)
-            std.fmt.bufPrintZ(&label_buf, "Scan {d}", .{state.file.scans[@intCast(scan_index)].scan_number}) catch "Scan -"
+        const label: [:0]const u8 = if (scan_index >= 0 and scan_index < vs.app_state.file.scans.len)
+            std.fmt.bufPrintSentinel(&label_buf, "Scan {d}", .{vs.app_state.file.scans[@intCast(scan_index)].scan_number}, 0) catch "Scan -"
         else
             "Scan -";
         if (ig.ImGui_Button("<-")) switch (kind) {
-            .ms1 => navPrevMs1(),
-            .ms2 => navPrevMs2(),
+            .ms1 => navPrevMs1(vs),
+            .ms2 => navPrevMs2(vs),
         };
         ig.ImGui_SameLine();
         _ = ig.ImGui_Button(label);
         ig.ImGui_SameLine();
         if (ig.ImGui_Button("->")) switch (kind) {
-            .ms1 => navNextMs1(),
-            .ms2 => navNextMs2(),
+            .ms1 => navNextMs1(vs),
+            .ms2 => navNextMs2(vs),
         };
     }
 }
 
 // ── Frame: build the UI from layout + state ────────────────────────────
-fn buildUI() void {
+fn buildUI(vs: *ViewerState) ViewerError!void {
     const viewport = ig.ImGui_GetMainViewport();
     const vp_pos = viewport.*.Pos;
     const vp_sz = viewport.*.Size;
@@ -327,14 +310,14 @@ fn buildUI() void {
     ig.ImGui_PushStyleColor(ig.ImGuiCol_WindowBg, 0xFF1A1A1F);
     defer ig.ImGui_PopStyleColor();
 
-    drawMenuBar();
+    drawMenuBar(vs);
     const menu_h: f32 = ig.ImGui_GetFrameHeightWithSpacing();
     const top_h: f32 = menu_h + TOOLBAR_HEIGHT;
 
-    const r = layoutRegions(vp_pos, vp_sz, top_h);
+    const r = layoutRegions(vs, vp_pos, vp_sz, top_h);
 
-    if (show_sidebar) {
-        scan_list_panel.draw(state, r.sidebar_x, r.work_y, r.sidebar_w, r.work_h, &show_sidebar, onScanSelected);
+    if (vs.show_sidebar) {
+        scan_list_panel.draw(&vs.scan_list, vs.app_state, r.sidebar_x, r.work_y, r.sidebar_w, r.work_h, &vs.show_sidebar, onScanSelected, vs);
     }
 
     // Two horizontal panels: upper = MS1, lower = MS2.
@@ -342,71 +325,85 @@ fn buildUI() void {
     const u_pos_y = r.work_y;
     const l_pos_y = r.work_y + half_h + 4;
 
-    switch (view_mode) {
+    switch (vs.view_mode) {
         .tic => {
-            drawScanNavigator("MS1Nav", r.main_x, u_pos_y, 160, NAV_BAR_HEIGHT, current_ms1_index, .ms1);
-            chromatogram_plot.draw(state, "MS1 Chromatogram (TIC)", r.main_x, u_pos_y + NAV_BAR_HEIGHT, r.main_w, half_h - NAV_BAR_HEIGHT, .tic, .ms1, gpa);
-            drawScanNavigator("MS2Nav", r.main_x, l_pos_y, 160, NAV_BAR_HEIGHT, current_ms2_index, .ms2);
-            chromatogram_plot.draw(state, "MS2 Chromatogram (TIC)", r.main_x, l_pos_y + NAV_BAR_HEIGHT, r.main_w, half_h - NAV_BAR_HEIGHT, .tic, .ms2, gpa);
+            drawScanNavigator(vs, "MS1Nav", r.main_x, u_pos_y, 160, NAV_BAR_HEIGHT, vs.current_ms1_index, .ms1);
+            try chromatogram_plot.draw(&vs.chromatogram, vs.app_state, "MS1 Chromatogram (TIC)", r.main_x, u_pos_y + NAV_BAR_HEIGHT, r.main_w, half_h - NAV_BAR_HEIGHT, .tic, .ms1, vs.gpa);
+            drawScanNavigator(vs, "MS2Nav", r.main_x, l_pos_y, 160, NAV_BAR_HEIGHT, vs.current_ms2_index, .ms2);
+            try chromatogram_plot.draw(&vs.chromatogram, vs.app_state, "MS2 Chromatogram (TIC)", r.main_x, l_pos_y + NAV_BAR_HEIGHT, r.main_w, half_h - NAV_BAR_HEIGHT, .tic, .ms2, vs.gpa);
         },
         .bpc => {
-            drawScanNavigator("MS1Nav", r.main_x, u_pos_y, 160, NAV_BAR_HEIGHT, current_ms1_index, .ms1);
-            chromatogram_plot.draw(state, "MS1 Chromatogram (BPC)", r.main_x, u_pos_y + NAV_BAR_HEIGHT, r.main_w, half_h - NAV_BAR_HEIGHT, .bpc, .ms1, gpa);
-            drawScanNavigator("MS2Nav", r.main_x, l_pos_y, 160, NAV_BAR_HEIGHT, current_ms2_index, .ms2);
-            chromatogram_plot.draw(state, "MS2 Chromatogram (BPC)", r.main_x, l_pos_y + NAV_BAR_HEIGHT, r.main_w, half_h - NAV_BAR_HEIGHT, .bpc, .ms2, gpa);
+            drawScanNavigator(vs, "MS1Nav", r.main_x, u_pos_y, 160, NAV_BAR_HEIGHT, vs.current_ms1_index, .ms1);
+            try chromatogram_plot.draw(&vs.chromatogram, vs.app_state, "MS1 Chromatogram (BPC)", r.main_x, u_pos_y + NAV_BAR_HEIGHT, r.main_w, half_h - NAV_BAR_HEIGHT, .bpc, .ms1, vs.gpa);
+            drawScanNavigator(vs, "MS2Nav", r.main_x, l_pos_y, 160, NAV_BAR_HEIGHT, vs.current_ms2_index, .ms2);
+            try chromatogram_plot.draw(&vs.chromatogram, vs.app_state, "MS2 Chromatogram (BPC)", r.main_x, l_pos_y + NAV_BAR_HEIGHT, r.main_w, half_h - NAV_BAR_HEIGHT, .bpc, .ms2, vs.gpa);
         },
         .scan => {
-            drawScanNavigator("MS1Nav", r.main_x, u_pos_y, 160, NAV_BAR_HEIGHT, current_ms1_index, .ms1);
-            spectrum_plot.draw(state, .ms1, "MS1 Spectrum", current_ms1_index, r.main_x, u_pos_y + NAV_BAR_HEIGHT, r.main_w, half_h - NAV_BAR_HEIGHT, gpa);
-            drawScanNavigator("MS2Nav", r.main_x, l_pos_y, 160, NAV_BAR_HEIGHT, current_ms2_index, .ms2);
-            spectrum_plot.draw(state, .ms2, "MS2 Spectrum", current_ms2_index, r.main_x, l_pos_y + NAV_BAR_HEIGHT, r.main_w, half_h - NAV_BAR_HEIGHT, gpa);
+            drawScanNavigator(vs, "MS1Nav", r.main_x, u_pos_y, 160, NAV_BAR_HEIGHT, vs.current_ms1_index, .ms1);
+            try spectrum_plot.draw(&vs.spectrum, vs.app_state, .ms1, "MS1 Spectrum", vs.current_ms1_index, r.main_x, u_pos_y + NAV_BAR_HEIGHT, r.main_w, half_h - NAV_BAR_HEIGHT, vs.gpa);
+            drawScanNavigator(vs, "MS2Nav", r.main_x, l_pos_y, 160, NAV_BAR_HEIGHT, vs.current_ms2_index, .ms2);
+            try spectrum_plot.draw(&vs.spectrum, vs.app_state, .ms2, "MS2 Spectrum", vs.current_ms2_index, r.main_x, l_pos_y + NAV_BAR_HEIGHT, r.main_w, half_h - NAV_BAR_HEIGHT, vs.gpa);
         },
     }
 
-    if (show_status) {
-        drawStatusBar(vp_pos.x, vp_pos.y + vp_sz.y - 24, vp_sz.x, 24);
+    if (vs.show_status) {
+        drawStatusBar(vs, vp_pos.x, vp_pos.y + vp_sz.y - 24, vp_sz.x, 24);
     }
 
-    drawToolbar();
-    _ = export_panel.draw_modal(&export_state);
+    drawToolbar(vs);
+    _ = export_panel.draw_modal(&vs.export_state);
 }
 
 // ── Entry ──────────────────────────────────────────────────────────────
-var window: app.Window = undefined;
-
 pub fn main(init: std.process.Init) !u8 {
     const io = init.io;
 
-    state = gpa.create(AppStateM.AppState) catch return error.OutOfMemory;
-    state.* = AppStateM.AppState.init(gpa, io);
+    var vs: ViewerState = .{};
+    vs.gpa = init.gpa;
+    vs.spectrum = spectrum_plot.init();
+    vs.chromatogram = chromatogram_plot.init();
+    vs.scan_list = scan_list_panel.init();
+    vs.export_state = export_panel.init();
+
+    vs.app_state = try vs.gpa.create(AppStateM.AppState);
+    vs.app_state.* = AppStateM.AppState.init(vs.gpa, io);
     defer {
-        spectrum_plot.release_mirror(gpa);
-        state.deinit();
-        gpa.destroy(state);
+        spectrum_plot.deinit(&vs.spectrum, vs.gpa);
+        chromatogram_plot.deinit(&vs.chromatogram);
+        scan_list_panel.deinit(&vs.scan_list);
+        export_panel.deinit(&vs.export_state, vs.gpa);
+        vs.app_state.deinit();
+        vs.gpa.destroy(vs.app_state);
     }
 
-    if (getOptionalFilePath()) |path| {
-        defer gpa.free(path);
-        openRawFile(path);
+    const args = try cli.get_args(init.gpa);
+    defer {
+        for (args) |a| init.gpa.free(a);
+        init.gpa.free(args);
+    }
+    if (args.len > 1) {
+        openRawFile(&vs, args[1]) catch |err| {
+            std.log.warn("Failed to open {s}: {s}", .{ args[1], @errorName(err) });
+        };
     }
 
-    window = app.Window.createImGui(1400, 900, "mzigRead — imguinz2 viewer") catch |err| {
+    vs.window = app.Window.createImGui(1400, 900, "mzigRead — imguinz2 viewer") catch |err| {
         std.log.err("failed to create imguinz2 window: {}", .{err});
         return 1;
     };
-    defer window.destroyImGui();
+    defer vs.window.destroyImGui();
 
     _ = app.setTheme(.dark);
 
     const imPlotContext = ip.ImPlot_CreateContext();
     defer ip.ImPlot_DestroyContext(imPlotContext);
 
-    while (running and !window.shouldClose()) {
-        window.pollEvents();
-        if (window.isIconified()) continue;
-        window.frame();
-        buildUI();
-        window.render();
+    while (vs.running and !vs.window.shouldClose()) {
+        vs.window.pollEvents();
+        if (vs.window.isIconified()) continue;
+        vs.window.frame();
+        buildUI(&vs) catch |err| std.log.warn("buildUI failed: {s}", .{@errorName(err)});
+        vs.window.render();
     }
 
     return 0;

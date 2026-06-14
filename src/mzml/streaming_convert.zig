@@ -11,6 +11,7 @@ const raw = @import("raw_file");
 const cv = @import("cv");
 const filter_string = @import("filter_string");
 const instrument_utils = @import("instrument_utils");
+const progress = @import("progress");
 
 const AnalyzerType = enum { unknown, orbitrap, astral, ion_trap, triple_quad };
 
@@ -73,6 +74,21 @@ pub fn convert_raw_to_mzml_streaming(
     source_file_location: ?[]const u8,
     options: mzml_writer.MzmlWriterOptions,
 ) StreamingConvertError!void {
+    return convert_raw_to_mzml_streaming_with_progress(io, allocator, state, output_path, source_file_name, source_file_location, options, null);
+}
+
+/// Convert a .raw file to mzML using streaming I/O, reporting progress
+/// periodically (roughly every 1 %) if `progress` is non-null.
+pub fn convert_raw_to_mzml_streaming_with_progress(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    state: *app.AppState,
+    output_path: []const u8,
+    source_file_name: ?[]const u8,
+    source_file_location: ?[]const u8,
+    options: mzml_writer.MzmlWriterOptions,
+    prog: ?progress.Reporter,
+) StreamingConvertError!void {
     if (state.file.scans.len == 0) return error.NoScans;
 
     const file = std.Io.Dir.cwd().createFile(io, output_path, .{}) catch return error.CreateFileFailed;
@@ -120,9 +136,13 @@ pub fn convert_raw_to_mzml_streaming(
 
     var last_ms1_scan: ?i32 = null;
     const total_scans = state.file.scans.len;
-    const progress_interval = @max(1, total_scans / 10);
+    const progress_interval = @max(1, total_scans / 100);
+    const log_interval = @max(1, total_scans / 10);
 
     for (state.file.scans, 0..) |scan_info, i| {
+        if (i % progress_interval == 0 or i == total_scans - 1) {
+            if (prog) |p| p.report(i + 1, total_scans);
+        }
         const load_result = state.load_scan_bulk(i) catch |err| {
             std.log.warn("Failed to load scan {d}: {s}", .{ scan_info.scan_number, @errorName(err) });
             try writeEmptySpectrum(&writer, scan_info, i);
@@ -139,7 +159,7 @@ pub fn convert_raw_to_mzml_streaming(
             last_ms1_scan = scan_info.scan_number;
         }
 
-        if (i > 0 and i % progress_interval == 0) {
+        if (i > 0 and i % log_interval == 0) {
             const pct = @divTrunc(i * 100, total_scans);
             std.log.info("Progress: {d}/{d} scans ({d}%)", .{ i, total_scans, pct });
         }

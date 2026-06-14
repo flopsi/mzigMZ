@@ -614,14 +614,3 @@ pub const AppState = struct {
         self.chromatogram_ms_level_filter = level;
     }
 };
-
-// Global singleton instance (thread-unsafe but Win32 is single-threaded anyway)
-var g_state: ?*AppState = null;
-
-pub fn set_global_state(state: *AppState) void {
-    g_state = state;
-}
-
-pub fn get_global_state() ?*AppState {
-    return g_state;
-}

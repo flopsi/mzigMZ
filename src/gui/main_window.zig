@@ -61,8 +61,6 @@ pub const CreateError = error{
 pub const RunError = CreateError;
 
 pub fn run(state: *app.AppState) RunError!void {
-    app.set_global_state(state);
-
     // Initialize common controls
     var icc: w32.INITCOMMONCONTROLSEX = undefined;
     icc.dwSize = @sizeOf(w32.INITCOMMONCONTROLSEX);
@@ -173,7 +171,7 @@ pub fn create(hInstance: w32.HINSTANCE, state: *app.AppState) CreateError!w32.HW
     }
 
     updateTitle(hwnd, state);
-    syncViewMenu();
+    syncViewMenu(state);
 
     // Populate scan list if file is already open
     if (state.file.scans.len > 0) {
@@ -250,9 +248,9 @@ fn mainWndProc(hwnd: w32.HWND, msg: w32.UINT, wParam: w32.WPARAM, lParam: w32.LP
         0x0400 + 1 => { // WM_USER + 1
             // Chromatogram click → switch to spectrum view and navigate to scan
             if (state) |s| {
-                const scan_index: usize = @intCast(wParam);
+                const scan_index = std.math.cast(usize, wParam) orelse return 0;
                 s.current_scan_index = scan_index;
-                switchToView(.spectrum);
+                switchToView(.spectrum, s);
                 afterScanChange(hwnd, s);
             }
             return 0;
@@ -314,7 +312,7 @@ fn handleNavScan(hwnd: w32.HWND, state: *app.AppState, nav_fn: *const fn (*app.A
     afterScanChange(hwnd, state);
 }
 
-fn switchToView(view: MainView) void {
+fn switchToView(view: MainView, state: *app.AppState) void {
     g_main_view = view;
     switch (view) {
         .spectrum => {
@@ -325,11 +323,8 @@ fn switchToView(view: MainView) void {
             if (g_canvas_hwnd) |cv| _ = w32.ShowWindow(cv, w32.SW_HIDE);
             if (g_chromatogram_hwnd) |cv| {
                 // Compute chromatograms on-demand if not already done
-                const state = app.get_global_state();
-                if (state) |s| {
-                    if (s.tic_chromatogram == null) {
-                        s.compute_chromatograms();
-                    }
+                if (state.tic_chromatogram == null) {
+                    state.compute_chromatograms();
                 }
                 chromatogram_canvas.set_chromatogram_type(.tic);
                 _ = w32.ShowWindow(cv, w32.SW_SHOW);
@@ -340,11 +335,8 @@ fn switchToView(view: MainView) void {
             if (g_canvas_hwnd) |cv| _ = w32.ShowWindow(cv, w32.SW_HIDE);
             if (g_chromatogram_hwnd) |cv| {
                 // Compute chromatograms on-demand if not already done
-                const state = app.get_global_state();
-                if (state) |s| {
-                    if (s.bpc_chromatogram == null) {
-                        s.compute_chromatograms();
-                    }
+                if (state.bpc_chromatogram == null) {
+                    state.compute_chromatograms();
                 }
                 chromatogram_canvas.set_chromatogram_type(.bpc);
                 _ = w32.ShowWindow(cv, w32.SW_SHOW);
@@ -352,7 +344,7 @@ fn switchToView(view: MainView) void {
             }
         },
     }
-    syncViewMenu();
+    syncViewMenu(state);
 }
 
 fn afterScanChange(hwnd: w32.HWND, state: *app.AppState) void {
@@ -365,7 +357,7 @@ fn afterScanChange(hwnd: w32.HWND, state: *app.AppState) void {
         chromatogram_canvas.invalidate(cv);
     }
     if (g_scan_list_hwnd) |sl| {
-        scan_list.select_scan(sl, state.current_scan_index);
+        scan_list.select_scan(sl, state.current_scan_index, state);
     }
 }
 
@@ -388,21 +380,21 @@ fn handleCommand(hwnd: w32.HWND, state: ?*app.AppState, wParam: w32.WPARAM) void
 
         IDM_VIEW_STICK => {
             s.view.view_mode = .stick;
-            syncViewMenu();
+            syncViewMenu(s);
             if (g_canvas_hwnd) |cv| spectrum_canvas.invalidate(cv);
         },
         IDM_VIEW_LINE => {
             s.view.view_mode = .line;
-            syncViewMenu();
+            syncViewMenu(s);
             if (g_canvas_hwnd) |cv| spectrum_canvas.invalidate(cv);
         },
-        IDM_VIEW_SPECTRUM => switchToView(.spectrum),
-        IDM_VIEW_TIC => switchToView(.tic),
-        IDM_VIEW_BPC => switchToView(.bpc),
+        IDM_VIEW_SPECTRUM => switchToView(.spectrum, s),
+        IDM_VIEW_TIC => switchToView(.tic, s),
+        IDM_VIEW_BPC => switchToView(.bpc, s),
 
         IDM_PARSE_METADATA => {
             s.view.parse_peak_metadata = !s.view.parse_peak_metadata;
-            syncViewMenu();
+            syncViewMenu(s);
             reloadCurrentScan(s);
         },
 
@@ -503,9 +495,8 @@ fn reloadCurrentScan(state: *app.AppState) void {
     if (g_canvas_hwnd) |cv| spectrum_canvas.invalidate(cv);
 }
 
-fn syncViewMenu() void {
+fn syncViewMenu(state: *app.AppState) void {
     const hMenu = g_menu orelse return;
-    const state = app.get_global_state() orelse return;
 
     _ = w32.CheckMenuItem(hMenu, IDM_PARSE_METADATA, if (state.view.parse_peak_metadata) w32.MF_CHECKED else w32.MF_UNCHECKED);
 
@@ -598,7 +589,11 @@ fn splitterWndProc(hwnd: w32.HWND, msg: w32.UINT, wParam: w32.WPARAM, lParam: w3
                 const max_x: i32 = rc.right - 200;
                 g_splitter_x = @max(min_x, @min(max_x, pt.x));
                 if (g_hwnd) |main| {
-                    layoutChildren(main, app.get_global_state() orelse return 0);
+                    if (getState(main)) |s| {
+                        layoutChildren(main, s);
+                    } else {
+                        return 0;
+                    }
                 }
             }
             return 0;

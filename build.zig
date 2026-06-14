@@ -35,12 +35,7 @@ pub fn build(b: *std.Build) void {
     spectrum_pool_mod.addImport("advanced_packet", packet_mod);
 
     // ---- raw_core/raw_file module -----------------------------------------
-    // PUBLISHED MODULE — consumed by the sibling `msViewer` repo via a
-    // build.zig.zon path dependency: dep.module("raw_file").
-    // DO NOT downgrade to b.createModule: that would silently break the
-    // msViewer link (path deps can only see modules published via addModule).
-    // See AGENTS.md § "Published modules (msViewer link)".
-    const raw_file_mod = b.addModule("raw_file", .{
+    const raw_file_mod = b.createModule(.{
         .root_source_file = b.path("src/raw_core/raw_file.zig"),
         .target = target,
         .optimize = optimize,
@@ -168,6 +163,13 @@ pub fn build(b: *std.Build) void {
     schema_mod_.addImport("raw_file", raw_file_mod);
     schema_mod_.addImport("advanced_packet", packet_mod);
 
+    // ---- core/progress module ---------------------------------------------
+    const core_progress_mod = b.createModule(.{
+        .root_source_file = b.path("src/core/progress.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     // ---- export/raw_file_writer module --------------------------------------
     const raw_file_writer_mod = b.createModule(.{
         .root_source_file = b.path("src/export/raw_file_writer.zig"),
@@ -181,6 +183,7 @@ pub fn build(b: *std.Build) void {
     raw_file_writer_mod.addImport("trailer_events", trailer_events_mod);
     raw_file_writer_mod.addImport("writer_primitives", writer_primitives_mod);
     raw_file_writer_mod.addImport("schema", schema_mod_);
+    raw_file_writer_mod.addImport("progress", core_progress_mod);
 
     // ---- file_state module ------------------------------------------------
     const file_state_mod = b.createModule(.{
@@ -203,11 +206,7 @@ pub fn build(b: *std.Build) void {
     view_state_mod.addImport("advanced_packet", packet_mod);
 
     // ---- scan_decoder module -----------------------------------------
-    // PUBLISHED MODULE — DO NOT downgrade to b.createModule: that would
-    // silently break the msViewer link (path deps can only see modules
-    // published via addModule). See AGENTS.md § "Published modules (msViewer
-    // link)". Added for Issue 17: msViewer needs the spectrum packet decoder.
-    const scan_decoder_mod = b.addModule("scan_decoder", .{
+    const scan_decoder_mod = b.createModule(.{
         .root_source_file = b.path("src/scan_decoder.zig"),
         .target = target,
         .optimize = optimize,
@@ -267,6 +266,11 @@ pub fn build(b: *std.Build) void {
     raw_file_mod.addImport("spec/instrument_id", spec_instrument_id_mod);
     raw_file_mod.addImport("spec/packet_header", spec_packet_header_mod);
     raw_file_mod.addImport("spec/scan_index", spec_scan_index_mod);
+
+    // Wire spec modules into raw_writer
+    raw_writer_mod.addImport("spec/file_header", spec_file_header_mod);
+    raw_writer_mod.addImport("spec/raw_info", spec_raw_info_mod);
+    raw_writer_mod.addImport("spec/run_header", spec_run_header_mod);
 
     // Wire spec modules into writer_primitives
     writer_primitives_mod.addImport("spec/scan_index", spec_scan_index_mod);
@@ -374,6 +378,7 @@ pub fn build(b: *std.Build) void {
     mzml_streaming_convert_mod.addImport("cv", mzml_cv_mod);
     mzml_streaming_convert_mod.addImport("filter_string", filter_string_mod);
     mzml_streaming_convert_mod.addImport("instrument_utils", core_instrument_utils_mod);
+    mzml_streaming_convert_mod.addImport("progress", core_progress_mod);
 
     // ---- cli modules -------------------------------------------------------
     const cli_args_internal_mod = b.createModule(.{
@@ -535,11 +540,8 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the Win32 viewer");
     run_step.dependOn(&run_cmd.step);
 
-    // PUBLISHED MODULE — consumed by the sibling `msViewer` repo via a
-    // build.zig.zon path dependency: dep.module("plot_math").
-    // DO NOT downgrade to b.createModule (see note on raw_file_mod above and
-    // AGENTS.md § "Published modules (msViewer link)").
-    const plot_math_mod = b.addModule("plot_math", .{
+    // ---- viewer/plot_math module ----------------------------------------
+    const plot_math_mod = b.createModule(.{
         .root_source_file = b.path("src/viewer/plot_math.zig"),
         .target = target,
         .optimize = optimize,
@@ -575,6 +577,7 @@ pub fn build(b: *std.Build) void {
     zgui_viewer_mod.addImport("raw_file_writer", raw_file_writer_mod);
     zgui_viewer_mod.addImport("streaming_convert", mzml_streaming_convert_mod);
     zgui_viewer_mod.addImport("mzml_writer", mzml_writer_mod);
+    zgui_viewer_mod.addImport("progress", core_progress_mod);
 
     const zgui_exe = b.addExecutable(.{
         .name = "raw-zgui-viewer",
@@ -1025,6 +1028,7 @@ pub fn build(b: *std.Build) void {
     check_checksum_mod.addImport("raw_file", raw_file_mod);
     check_checksum_mod.addImport("checksum", checksum_mod_);
     check_checksum_mod.addImport("cli_args", cli_args_mod);
+    check_checksum_mod.addImport("spec/file_header", spec_file_header_mod);
 
     const check_checksum_exe = b.addExecutable(.{
         .name = "check_checksum",
