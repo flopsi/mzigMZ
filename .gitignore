@@ -1,0 +1,55 @@
+# Zig build artifacts
+.zig-cache/
+zig-cache/
+zig-out/
+
+# Debug / test outputs
+*.tsv
+*.csv
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Secrets
+.env
+*.pem
+*.key
+
+# User data
+fixtures/
+data/
+
+# Generated test artifacts
+tests/ground_truth/
+
+# Agent skills — vendored stdlib snapshots and skill scaffolding
+.pi/skills/zig-quality/sources/
+.pi/skills-main/
+
+# Stray build artifacts that escape to the project root
+# (zig build installs to zig-out/bin/, not the root, but some
+# test executables and Windows artifacts do end up here)
+/nul
+/*.exe
+/*.pdb
+/zig-pkg/
+/.scratch/
+
+# Vendored third-party SDKs
+/SDL3-3.4.10/
+
+# Docs (all generated/agent-assisted)
+/docs/
+
+# Agent-internal files (not for public repo)
+/.pi/
+/.claude/
+/AGENTS.md
+/LANGUAGE.md
+/CONTEXT.md
