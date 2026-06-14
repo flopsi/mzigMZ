@@ -249,7 +249,7 @@ fn updateScanEdit(state: *app.AppState) void {
         return;
     }
     var buf: [32]u8 = undefined;
-    const text = std.fmt.bufPrintZ(&buf, "{d}", .{state.file.scans[state.current_scan_index].scan_number}) catch "";
+    const text = std.fmt.bufPrintSentinel(&buf, "{d}", .{state.file.scans[state.current_scan_index].scan_number}, 0) catch "";
     var buf16: [32]u16 = undefined;
     const len = std.unicode.utf8ToUtf16Le(&buf16, text) catch 0;
     buf16[len] = 0;
@@ -290,17 +290,12 @@ pub fn handle_scan_edit_enter(state: *app.AppState) void {
     }
 }
 
-pub fn select_scan(hwnd: w32.HWND, scan_index: usize) void {
+pub fn select_scan(hwnd: w32.HWND, scan_index: usize, state: *app.AppState) void {
     g_selecting_programmatically = true;
     defer g_selecting_programmatically = false;
 
     // In virtual mode, the item index is the position in the filtered list.
     // We need to find which filtered position corresponds to this scan index.
-    const state = app.get_global_state() orelse {
-        _ = w32.list_view_set_item_state(hwnd, @intCast(scan_index), w32.LVIS_SELECTED, w32.LVIS_SELECTED);
-        _ = w32.list_view_ensure_visible(hwnd, @intCast(scan_index), 0);
-        return;
-    };
     if (state.filtered_indices) |fi| {
         for (fi, 0..) |idx, i| {
             if (idx == scan_index) {
@@ -317,15 +312,14 @@ pub fn select_scan(hwnd: w32.HWND, scan_index: usize) void {
     updateScanEdit(state);
 }
 
-pub fn get_selected_scan_index(hwnd: w32.HWND) ?usize {
+pub fn get_selected_scan_index(hwnd: w32.HWND, state: *app.AppState) ?usize {
     const sel = w32.list_view_get_next_item(hwnd, -1, w32.LVNI_SELECTED);
     if (sel < 0) return null;
-    const state = app.get_global_state() orelse return @intCast(sel);
     if (state.filtered_indices) |fi| {
-        const idx: usize = @intCast(sel);
+        const idx = std.math.cast(usize, sel) orelse return null;
         if (idx < fi.len) return fi[idx];
     }
-    return @intCast(sel);
+    return std.math.cast(usize, sel) orelse null;
 }
 
 /// Navigate to a specific scan index (updates state, list selection, canvas)
@@ -334,7 +328,7 @@ fn navigateToScanIndex(state: *app.AppState, scan_index: usize) void {
     state.load_scan(scan_index) catch {};
     state.current_scan_index = scan_index;
     if (g_list_hwnd) |list| {
-        select_scan(list, scan_index);
+        select_scan(list, scan_index, state);
     }
     // Notify parent to update canvas and title
     if (g_parent_hwnd) |parent| {
@@ -348,12 +342,11 @@ fn navigateToScanIndex(state: *app.AppState, scan_index: usize) void {
 
 /// Handle LVN_GETDISPINFO for virtual list view.
 /// The ListView asks for text for only the visible rows.
-pub fn handle_get_disp_info(pnmh: *w32.NMHDR) void {
+pub fn handle_get_disp_info(pnmh: *w32.NMHDR, state: *app.AppState) void {
     const pdi = @as(*w32.NMLVDISPINFOW, @ptrCast(pnmh));
-    const state = app.get_global_state() orelse return;
     if (state.file.scans.len == 0) return;
 
-    const item_idx: usize = @intCast(pdi.item.iItem);
+    const item_idx = std.math.cast(usize, pdi.item.iItem) orelse return;
     const scan_idx = if (state.filtered_indices) |fi| blk: {
         if (item_idx >= fi.len) return;
         break :blk fi[item_idx];
@@ -371,13 +364,13 @@ pub fn handle_get_disp_info(pnmh: *w32.NMHDR) void {
 
     switch (pdi.item.iSubItem) {
         0 => { // Scan number
-            const text = std.fmt.bufPrintZ(&buf, "{d}", .{scan.scan_number}) catch "0";
+            const text = std.fmt.bufPrintSentinel(&buf, "{d}", .{scan.scan_number}, 0) catch "0";
             const len = @min(text.len, max_write);
             for (0..len) |i| pszText[i] = text[i];
             pszText[len] = 0;
         },
         1 => { // MS level
-            const text = std.fmt.bufPrintZ(&buf, "{d}", .{scan.ms_level}) catch "?";
+            const text = std.fmt.bufPrintSentinel(&buf, "{d}", .{scan.ms_level}, 0) catch "?";
             const len = @min(text.len, max_write);
             for (0..len) |i| pszText[i] = text[i];
             pszText[len] = 0;
@@ -390,7 +383,7 @@ pub fn handle_get_disp_info(pnmh: *w32.NMHDR) void {
         },
         3 => { // Charge
             const text = if (scan.charge_state > 0)
-                std.fmt.bufPrintZ(&buf, "{d}", .{scan.charge_state}) catch "?"
+                std.fmt.bufPrintSentinel(&buf, "{d}", .{scan.charge_state}, 0) catch "?"
             else
                 "-";
             const len = @min(text.len, max_write);
@@ -399,7 +392,7 @@ pub fn handle_get_disp_info(pnmh: *w32.NMHDR) void {
         },
         4 => { // Precursor m/z
             const text = if (scan.precursor_mz > 0)
-                std.fmt.bufPrintZ(&buf, "{d:.2}", .{scan.precursor_mz}) catch "?"
+                std.fmt.bufPrintSentinel(&buf, "{d:.2}", .{scan.precursor_mz}, 0) catch "?"
             else
                 "-";
             const len = @min(text.len, max_write);
@@ -408,7 +401,7 @@ pub fn handle_get_disp_info(pnmh: *w32.NMHDR) void {
         },
         5 => { // Peaks
             const text = if (scan.peak_count > 0)
-                std.fmt.bufPrintZ(&buf, "{d}", .{scan.peak_count}) catch "0"
+                std.fmt.bufPrintSentinel(&buf, "{d}", .{scan.peak_count}, 0) catch "0"
             else
                 "-";
             const len = @min(text.len, max_write);
@@ -416,7 +409,7 @@ pub fn handle_get_disp_info(pnmh: *w32.NMHDR) void {
             pszText[len] = 0;
         },
         6 => { // Size
-            const text = std.fmt.bufPrintZ(&buf, "{d}", .{scan.data_size}) catch "0";
+            const text = std.fmt.bufPrintSentinel(&buf, "{d}", .{scan.data_size}, 0) catch "0";
             const len = @min(text.len, max_write);
             for (0..len) |i| pszText[i] = text[i];
             pszText[len] = 0;
@@ -429,7 +422,7 @@ pub fn handle_notify(pnmh: *w32.NMHDR, state: *app.AppState) void {
     switch (pnmh.code) {
         w32.LVN_ITEMCHANGED => {
             if (g_selecting_programmatically) return;
-            if (get_selected_scan_index(pnmh.hwndFrom)) |sel_idx| {
+            if (get_selected_scan_index(pnmh.hwndFrom, state)) |sel_idx| {
                 state.load_scan(sel_idx) catch {};
                 state.current_scan_index = sel_idx;
                 updateScanEdit(state);
@@ -440,7 +433,7 @@ pub fn handle_notify(pnmh: *w32.NMHDR, state: *app.AppState) void {
             }
         },
         w32.LVN_GETDISPINFO => {
-            handle_get_disp_info(pnmh);
+            handle_get_disp_info(pnmh, state);
         },
         else => {},
     }
@@ -494,12 +487,12 @@ pub fn handle_filter_command(state: *app.AppState, cmd_id: u16, parent: w32.HWND
         if (state.filtered_indices) |fi| {
             if (fi.len > 0) {
                 const first_visible = fi[0];
-                select_scan(list, first_visible);
+                select_scan(list, first_visible, state);
                 state.load_scan(first_visible) catch {};
                 state.current_scan_index = first_visible;
             }
         } else if (state.file.scans.len > 0) {
-            select_scan(list, 0);
+            select_scan(list, 0, state);
             state.load_scan(0) catch {};
             state.current_scan_index = 0;
         }

@@ -25,11 +25,38 @@ pub const Kind = enum { ms1, ms2 };
 
 pub const PlotMode = enum { stems, line };
 
-/// Plot mode defaults. Profile data is drawn as a continuous line; centroid
-/// data is always drawn as stems because connecting centroid peaks implies a
-/// false continuum. User can still override per panel.
-var plot_modes: [2]PlotMode = .{ .line, .line };
-var show_peak_labels: [2]bool = .{ true, true };
+pub const DrawError = std.mem.Allocator.Error;
+
+pub const State = struct {
+    /// Plot mode defaults. Profile data is drawn as a continuous line; centroid
+    /// data is always drawn as stems because connecting centroid peaks implies a
+    /// false continuum. User can still override per panel.
+    plot_modes: [2]PlotMode = .{ .line, .line },
+    show_peak_labels: [2]bool = .{ true, true },
+
+    /// Current x-axis zoom state for each panel. Persisted across frames so the
+    /// user can zoom and pan without losing the view on every redraw.
+    zoom_mz_min: [2]f64 = .{ MZRange.MS1.min, MZRange.MS2.min },
+    zoom_mz_max: [2]f64 = .{ MZRange.MS1.max, MZRange.MS2.max },
+
+    // Cached f64 mirror of spectrum.intensity[]. Allocated once, reused.
+    mirror: ?[]f64 = null,
+    mirror_source_ptr: ?[*]const f64 = null,
+    mirror_source_len: usize = 0,
+};
+
+pub fn init() State {
+    return .{};
+}
+
+pub fn deinit(self: *State, allocator: std.mem.Allocator) void {
+    if (self.mirror) |old| {
+        allocator.free(old);
+        self.mirror = null;
+        self.mirror_source_ptr = null;
+        self.mirror_source_len = 0;
+    }
+}
 
 /// Best default plot mode for a given packet type.
 fn defaultModeForPacketType(packet_type: u32) PlotMode {
@@ -45,21 +72,16 @@ pub const MZRange = struct {
     pub const MS2 = MZRange{ .min = 145, .max = 2000 };
 };
 
-/// Current x-axis zoom state for each panel. Persisted across frames so the
-/// user can zoom and pan without losing the view on every redraw.
-var zoom_mz_min: [2]f64 = .{ MZRange.MS1.min, MZRange.MS2.min };
-var zoom_mz_max: [2]f64 = .{ MZRange.MS1.max, MZRange.MS2.max };
-
 /// Reset zoom to the full fixed range for a panel. Called when the scan
 /// changes so the user starts from the full-range view.
-pub fn reset_zoom(kind: Kind) void {
+pub fn reset_zoom(self: *State, kind: Kind) void {
     const range = switch (kind) {
         .ms1 => MZRange.MS1,
         .ms2 => MZRange.MS2,
     };
     const idx = @intFromEnum(kind);
-    zoom_mz_min[idx] = range.min;
-    zoom_mz_max[idx] = range.max;
+    self.zoom_mz_min[idx] = range.min;
+    self.zoom_mz_max[idx] = range.max;
 }
 
 /// Clamp value to [low, high].
@@ -70,9 +92,9 @@ fn clamp(v: f64, low: f64, high: f64) f64 {
 /// Zoom/pan the x-axis window from mouse-wheel input.
 ///   - Vertical wheel (wheel_y) zooms in/out around the view center.
 ///   - Shift+vertical wheel or horizontal wheel (wheel_x) pans left/right.
-fn updateZoomPan(idx: usize, range: MZRange, wheel_y: f32, wheel_x: f32, shift_held: bool) void {
-    const cur_min = zoom_mz_min[idx];
-    const cur_max = zoom_mz_max[idx];
+fn updateZoomPan(self: *State, idx: usize, range: MZRange, wheel_y: f32, wheel_x: f32, shift_held: bool) void {
+    const cur_min = self.zoom_mz_min[idx];
+    const cur_max = self.zoom_mz_max[idx];
     const span = cur_max - cur_min;
 
     // Pan takes priority when Shift is held or horizontal wheel is used.
@@ -90,8 +112,8 @@ fn updateZoomPan(idx: usize, range: MZRange, wheel_y: f32, wheel_x: f32, shift_h
             new_min -= new_max - range.max;
             new_max = range.max;
         }
-        zoom_mz_min[idx] = clamp(new_min, range.min, range.max);
-        zoom_mz_max[idx] = clamp(new_max, range.min, range.max);
+        self.zoom_mz_min[idx] = clamp(new_min, range.min, range.max);
+        self.zoom_mz_max[idx] = clamp(new_max, range.min, range.max);
         return;
     }
 
@@ -113,26 +135,21 @@ fn updateZoomPan(idx: usize, range: MZRange, wheel_y: f32, wheel_x: f32, shift_h
         new_min -= new_max - range.max;
         new_max = range.max;
     }
-    zoom_mz_min[idx] = clamp(new_min, range.min, range.max);
-    zoom_mz_max[idx] = clamp(new_max, range.min, range.max);
+    self.zoom_mz_min[idx] = clamp(new_min, range.min, range.max);
+    self.zoom_mz_max[idx] = clamp(new_max, range.min, range.max);
 }
 
-// Cached f64 mirror of spectrum.intensity[]. Allocated once, reused.
-var mirror: ?[]f64 = null;
-var mirror_source_ptr: ?[*]const f64 = null;
-var mirror_source_len: usize = 0;
-
-fn ensureMirror(allocator: std.mem.Allocator, spec: *const advanced.Spectrum) !?[]f64 {
+fn ensureMirror(self: *State, allocator: std.mem.Allocator, spec: *const advanced.Spectrum) DrawError!?[]f64 {
     const key_ptr: [*]const f64 = spec.mz.ptr;
-    if (mirror_source_ptr != null and mirror_source_ptr.? == key_ptr and mirror_source_len == spec.mz.len and mirror != null) {
-        return mirror;
+    if (self.mirror_source_ptr != null and self.mirror_source_ptr.? == key_ptr and self.mirror_source_len == spec.mz.len and self.mirror != null) {
+        return self.mirror;
     }
-    if (mirror) |old| allocator.free(old);
+    if (self.mirror) |old| allocator.free(old);
     const buf = try allocator.alloc(f64, spec.intensity.len);
     for (spec.intensity, 0..) |v, i| buf[i] = @floatCast(v);
-    mirror = buf;
-    mirror_source_ptr = key_ptr;
-    mirror_source_len = spec.mz.len;
+    self.mirror = buf;
+    self.mirror_source_ptr = key_ptr;
+    self.mirror_source_len = spec.mz.len;
     return buf;
 }
 
@@ -161,12 +178,13 @@ fn drawPeakLabels(mz: []const f64, intensity: []const f64) void {
     var label_buf: [32]u8 = undefined;
     for (top[0..count]) |p| {
         if (p.inten <= 0) continue;
-        const label = std.fmt.bufPrintZ(&label_buf, "{d:.2}", .{mz[p.idx]}) catch continue;
+        const label = std.fmt.bufPrintSentinel(&label_buf, "{d:.2}", .{mz[p.idx]}, 0) catch continue;
         ip.ImPlot_PlotText(label, mz[p.idx], intensity[p.idx], .{ .x = 0, .y = -15 }, 0);
     }
 }
 
 pub fn draw(
+    self: *State,
     state: *AppState,
     kind: Kind,
     title: [*:0]const u8,
@@ -176,7 +194,7 @@ pub fn draw(
     w: f32,
     h: f32,
     allocator: std.mem.Allocator,
-) void {
+) DrawError!void {
     ig.ImGui_SetNextWindowPosEx(.{ .x = x, .y = y }, ig.ImGuiCond_Always, .{ .x = 0, .y = 0 });
     ig.ImGui_SetNextWindowSize(.{ .x = w, .y = h }, ig.ImGuiCond_Always);
 
@@ -191,15 +209,15 @@ pub fn draw(
     const info_text = if (scan_index >= 0 and scan_index < state.file.scans.len) blk: {
         const scan = state.file.scans[@intCast(scan_index)];
         if (scan.ms_level >= 2) {
-            break :blk std.fmt.bufPrintZ(&info_buf, "Scan {d}  MS{d}  RT {d:.2}  prec {d:.4}  z={d}", .{
+            break :blk std.fmt.bufPrintSentinel(&info_buf, "Scan {d}  MS{d}  RT {d:.2}  prec {d:.4}  z={d}", .{
                 scan.scan_number, scan.ms_level, scan.rt, scan.precursor_mz, scan.charge_state,
-            }) catch "(no scan)";
+            }, 0) catch "(no scan)";
         }
-        break :blk std.fmt.bufPrintZ(&info_buf, "Scan {d}  MS{d}  RT {d:.2}", .{
+        break :blk std.fmt.bufPrintSentinel(&info_buf, "Scan {d}  MS{d}  RT {d:.2}", .{
             scan.scan_number, scan.ms_level, scan.rt,
-        }) catch "(no scan)";
-    } else std.fmt.bufPrintZ(&info_buf, "(no scan)", .{}) catch "(no scan)";
-    ig.ImGui_Text("%s", @as([*c]const u8, info_text));
+        }, 0) catch "(no scan)";
+    } else std.fmt.bufPrintSentinel(&info_buf, "(no scan)", .{}, 0) catch "(no scan)";
+    ig.ImGui_Text("%s", @as([*c]const u8, info_text.ptr));
 
     // Load the spectrum for the given scan index. We have to manipulate
     // current_scan_index temporarily to use currentSpectrum() since it reads
@@ -215,17 +233,17 @@ pub fn draw(
     const mode_idx = @intFromEnum(kind);
     const scan = state.file.scans[@intCast(scan_index)];
     const default_mode = defaultModeForPacketType(scan.packet_type);
-    if (ig.ImGui_RadioButton("Stems", plot_modes[mode_idx] == .stems)) plot_modes[mode_idx] = .stems;
+    if (ig.ImGui_RadioButton("Stems", self.plot_modes[mode_idx] == .stems)) self.plot_modes[mode_idx] = .stems;
     ig.ImGui_SameLine();
-    if (ig.ImGui_RadioButton("Line", plot_modes[mode_idx] == .line)) plot_modes[mode_idx] = .line;
+    if (ig.ImGui_RadioButton("Line", self.plot_modes[mode_idx] == .line)) self.plot_modes[mode_idx] = .line;
     ig.ImGui_SameLine();
-    _ = ig.ImGui_Checkbox("Peak labels", &show_peak_labels[mode_idx]);
+    _ = ig.ImGui_Checkbox("Peak labels", &self.show_peak_labels[mode_idx]);
     if (state.current_scan_index != scan_index) {
-        reset_zoom(kind);
+        reset_zoom(self, kind);
         state.load_scan(@intCast(scan_index)) catch |err| {
             var msg: [128]u8 = undefined;
-            const text = std.fmt.bufPrintZ(&msg, "loadScan({d}) failed: {s}", .{ scan_index, @errorName(err) }) catch "loadScan failed";
-            ig.ImGui_Text("%s", @as([*c]const u8, text));
+            const text = std.fmt.bufPrintSentinel(&msg, "loadScan({d}) failed: {s}", .{ scan_index, @errorName(err) }, 0) catch "loadScan failed";
+            ig.ImGui_Text("%s", @as([*c]const u8, text.ptr));
             return;
         };
     }
@@ -241,12 +259,7 @@ pub fn draw(
         return;
     }
 
-    const buf = ensureMirror(allocator, &spec) catch |err| blk: {
-        var msg: [128]u8 = undefined;
-        const text = std.fmt.bufPrintZ(&msg, "Mirror alloc failed: {s}", .{@errorName(err)}) catch &[_:0]u8{};
-        ig.ImGui_Text("%s", @as([*c]const u8, text));
-        break :blk @as(?[]f64, null);
-    };
+    const buf = try ensureMirror(self, allocator, &spec);
     if (buf) |b| {
         const range = switch (kind) {
             .ms1 => MZRange.MS1,
@@ -261,42 +274,32 @@ pub fn draw(
             const wheel_y = io_ptr.*.MouseWheel;
             const wheel_x = io_ptr.*.MouseWheelH;
             const shift_held = io_ptr.*.KeyShift;
-            updateZoomPan(idx, range, wheel_y, wheel_x, shift_held);
+            updateZoomPan(self, idx, range, wheel_y, wheel_x, shift_held);
 
             ip.ImPlot_SetupAxis(ip.ImAxis_X1, "m/z", 0);
-            ip.ImPlot_SetupAxisLimits(ip.ImAxis_X1, zoom_mz_min[idx], zoom_mz_max[idx], ip.ImPlotCond_Always);
+            ip.ImPlot_SetupAxisLimits(ip.ImAxis_X1, self.zoom_mz_min[idx], self.zoom_mz_max[idx], ip.ImPlotCond_Always);
             ip.ImPlot_SetupAxis(ip.ImAxis_Y1, "Intensity", 0);
             // Auto-fit y-axis: 0 to max*1.05. Per-panel, so MS1 and MS2 have
             // independent scales (MS2 peaks can be much taller than MS1).
             ip.ImPlot_SetupAxisLimits(ip.ImAxis_Y1, 0, @as(f64, spec.get_intensity_max()) * 1.05, ip.ImPlotCond_Always);
             ip.ImPlot_SetupFinish();
 
-            const n: c_int = @intCast(spec.point_count());
-            const user_mode = plot_modes[@intFromEnum(kind)];
+            const user_mode = self.plot_modes[@intFromEnum(kind)];
             const mode = if (user_mode == .line) default_mode else user_mode;
             switch (mode) {
                 .line => {
                     ip.ImPlot_SetNextLineStyle(.{ .x = 0.3, .y = 0.5, .z = 1.0, .w = 1 }, 1.0);
-                    ip.ImPlot_PlotLine_doublePtrdoublePtr("Spectrum", spec.mz.ptr, b.ptr, n, 0, 0, @sizeOf(f64));
+                    ip.ImPlot_PlotLine_doublePtrdoublePtr("Spectrum", spec.mz.ptr, b.ptr, @intCast(spec.point_count()), 0, 0, @sizeOf(f64));
                 },
                 .stems => {
                     ip.ImPlot_SetNextLineStyle(.{ .x = 0.3, .y = 0.5, .z = 1.0, .w = 1 }, 1.0);
-                    ip.ImPlot_PlotStems_doublePtrdoublePtr("Spectrum", spec.mz.ptr, b.ptr, n, 0, 0, 0, @sizeOf(f64));
+                    ip.ImPlot_PlotStems_doublePtrdoublePtr("Spectrum", spec.mz.ptr, b.ptr, @intCast(spec.point_count()), 0, 0, 0, @sizeOf(f64));
                 },
             }
 
-            if (show_peak_labels[@intFromEnum(kind)]) {
+            if (self.show_peak_labels[@intFromEnum(kind)]) {
                 drawPeakLabels(spec.mz, b);
             }
         }
-    }
-}
-
-pub fn release_mirror(allocator: std.mem.Allocator) void {
-    if (mirror) |old| {
-        allocator.free(old);
-        mirror = null;
-        mirror_source_ptr = null;
-        mirror_source_len = 0;
     }
 }

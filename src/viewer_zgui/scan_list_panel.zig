@@ -8,11 +8,22 @@ const LOCKED_PANEL_FLAGS: c_int = ig.ImGuiWindowFlags_NoMove | ig.ImGuiWindowFla
     ig.ImGuiWindowFlags_NoCollapse | ig.ImGuiWindowFlags_NoSavedSettings |
     ig.ImGuiWindowFlags_NoDocking;
 
-pub const SelectionCallback = *const fn (scan_index: usize) void;
+pub const SelectionCallback = *const fn (context: ?*anyopaque, scan_index: usize) void;
 
-var current_index: i32 = 0;
+pub const State = struct {
+    current_index: i32 = 0,
+};
+
+pub fn init() State {
+    return .{};
+}
+
+pub fn deinit(self: *State) void {
+    _ = self;
+}
 
 pub fn draw(
+    self: *State,
     state: *AppState,
     x: f32,
     y: f32,
@@ -20,6 +31,7 @@ pub fn draw(
     h: f32,
     show: *bool,
     on_select: SelectionCallback,
+    context: ?*anyopaque,
 ) void {
     ig.ImGui_SetNextWindowPosEx(.{ .x = x, .y = y }, ig.ImGuiCond_Always, .{ .x = 0, .y = 0 });
     ig.ImGui_SetNextWindowSize(.{ .x = w, .y = h }, ig.ImGuiCond_Always);
@@ -84,11 +96,11 @@ pub fn draw(
         ig.ImGui_TableNextRowEx(0, 0);
         _ = ig.ImGui_TableNextColumn();
         var buf: [32]u8 = undefined;
-        const lbl = std.fmt.bufPrintZ(&buf, "{d}", .{scan.scan_number}) catch continue;
-        _ = ig.ImGui_SelectableEx(lbl, i == current_index, 0, .{ .x = 0, .y = 0 });
+        const lbl = std.fmt.bufPrintSentinel(&buf, "{d}", .{scan.scan_number}, 0) catch continue;
+        _ = ig.ImGui_SelectableEx(lbl, i == self.current_index, 0, .{ .x = 0, .y = 0 });
         if (ig.ImGui_IsItemClicked()) {
-            current_index = i;
-            on_select(@intCast(i));
+            self.current_index = i;
+            on_select(context, @intCast(i));
         }
         _ = ig.ImGui_TableNextColumn();
         ig.ImGui_Text("%.2f", scan.rt);

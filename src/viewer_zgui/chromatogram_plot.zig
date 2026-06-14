@@ -20,11 +20,23 @@ const LOCKED_PANEL_FLAGS: c_int = ig.ImGuiWindowFlags_NoMove | ig.ImGuiWindowFla
 pub const Kind = enum { tic, bpc };
 pub const MsFilter = enum { all, ms1, ms2 };
 
-/// Zoom state for each chromatogram panel, keyed by (kind, filter).
-/// Index = @intFromEnum(kind) * 3 + @intFromEnum(filter).
-var rt_zoom_min: [6]f64 = .{ 0, 0, 0, 0, 0, 0 };
-var rt_zoom_max: [6]f64 = .{ 0, 0, 0, 0, 0, 0 };
-var rt_zoom_initialized: [6]bool = .{ false, false, false, false, false, false };
+pub const DrawError = FilterError;
+
+pub const State = struct {
+    /// Zoom state for each chromatogram panel, keyed by (kind, filter).
+    /// Index = @intFromEnum(kind) * 3 + @intFromEnum(filter).
+    rt_zoom_min: [6]f64 = .{ 0, 0, 0, 0, 0, 0 },
+    rt_zoom_max: [6]f64 = .{ 0, 0, 0, 0, 0, 0 },
+    rt_zoom_initialized: [6]bool = .{ false, false, false, false, false, false },
+};
+
+pub fn init() State {
+    return .{};
+}
+
+pub fn deinit(self: *State) void {
+    _ = self;
+}
 
 fn zoomIndex(kind: Kind, filter: MsFilter) usize {
     return @as(usize, @intFromEnum(kind)) * 3 + @as(usize, @intFromEnum(filter));
@@ -35,9 +47,9 @@ fn clamp(v: f64, low: f64, high: f64) f64 {
 }
 
 /// Zoom/pan the x-axis window from mouse-wheel input.
-fn updateZoomPan(idx: usize, abs_min: f64, abs_max: f64, wheel_y: f32, wheel_x: f32, shift_held: bool) void {
-    const cur_min = rt_zoom_min[idx];
-    const cur_max = rt_zoom_max[idx];
+fn updateZoomPan(self: *State, idx: usize, abs_min: f64, abs_max: f64, wheel_y: f32, wheel_x: f32, shift_held: bool) void {
+    const cur_min = self.rt_zoom_min[idx];
+    const cur_max = self.rt_zoom_max[idx];
     const span = cur_max - cur_min;
 
     const pan_input = wheel_x + (if (shift_held) wheel_y else 0);
@@ -53,8 +65,8 @@ fn updateZoomPan(idx: usize, abs_min: f64, abs_max: f64, wheel_y: f32, wheel_x: 
             new_min -= new_max - abs_max;
             new_max = abs_max;
         }
-        rt_zoom_min[idx] = clamp(new_min, abs_min, abs_max);
-        rt_zoom_max[idx] = clamp(new_max, abs_min, abs_max);
+        self.rt_zoom_min[idx] = clamp(new_min, abs_min, abs_max);
+        self.rt_zoom_max[idx] = clamp(new_max, abs_min, abs_max);
         return;
     }
 
@@ -74,8 +86,8 @@ fn updateZoomPan(idx: usize, abs_min: f64, abs_max: f64, wheel_y: f32, wheel_x: 
         new_min -= new_max - abs_max;
         new_max = abs_max;
     }
-    rt_zoom_min[idx] = clamp(new_min, abs_min, abs_max);
-    rt_zoom_max[idx] = clamp(new_max, abs_min, abs_max);
+    self.rt_zoom_min[idx] = clamp(new_min, abs_min, abs_max);
+    self.rt_zoom_max[idx] = clamp(new_max, abs_min, abs_max);
 }
 
 /// Compute the order-of-magnitude exponent for displaying TIC intensity
@@ -115,6 +127,7 @@ pub fn filter_by_ms_level(allocator: std.mem.Allocator, cg: *const Chromatogram,
 }
 
 pub fn draw(
+    self: *State,
     state: *AppState,
     title: [*:0]const u8,
     x: f32,
@@ -124,7 +137,7 @@ pub fn draw(
     kind: Kind,
     filter: MsFilter,
     allocator: std.mem.Allocator,
-) void {
+) DrawError!void {
     ig.ImGui_SetNextWindowPosEx(.{ .x = x, .y = y }, ig.ImGuiCond_Always, .{ .x = 0, .y = 0 });
     ig.ImGui_SetNextWindowSize(.{ .x = w, .y = h }, ig.ImGuiCond_Always);
 
@@ -151,54 +164,47 @@ pub fn draw(
     }
 
     // Filter the data. For "all" we just copy; for ms1/ms2 we filter.
-    const buf = filter_by_ms_level(allocator, &cg, filter) catch |err| blk: {
-        var msg: [128]u8 = undefined;
-        const text = std.fmt.bufPrintZ(&msg, "Filter alloc failed: {s}", .{@errorName(err)}) catch &[_:0]u8{};
-        ig.ImGui_Text("%s", @as([*c]const u8, text));
-        break :blk @as(?[]f64, null);
-    };
-    defer if (buf) |b| allocator.free(b);
-    if (buf) |b| {
-        const n: c_int = @intCast(b.len / 2);
-        const rt = b[0..@intCast(n)];
-        const inten = b[@intCast(n)..];
+    const buf = try filter_by_ms_level(allocator, &cg, filter);
+    defer allocator.free(buf);
+    const n: c_int = @intCast(buf.len / 2);
+    const rt = buf[0..@intCast(n)];
+    const inten = buf[@intCast(n)..];
 
-        // Absolute RT bounds for this panel.
-        const abs_min_rt: f64 = if (rt.len > 0) @max(0, @floor(rt[0])) else 0;
-        const abs_max_rt: f64 = if (rt.len > 0) @ceil(rt[rt.len - 1]) else 1;
+    // Absolute RT bounds for this panel.
+    const abs_min_rt: f64 = if (rt.len > 0) @max(0, @floor(rt[0])) else 0;
+    const abs_max_rt: f64 = if (rt.len > 0) @ceil(rt[rt.len - 1]) else 1;
 
-        const zi = zoomIndex(kind, filter);
-        if (!rt_zoom_initialized[zi]) {
-            rt_zoom_min[zi] = abs_min_rt;
-            rt_zoom_max[zi] = abs_max_rt;
-            rt_zoom_initialized[zi] = true;
-        }
+    const zi = zoomIndex(kind, filter);
+    if (!self.rt_zoom_initialized[zi]) {
+        self.rt_zoom_min[zi] = abs_min_rt;
+        self.rt_zoom_max[zi] = abs_max_rt;
+        self.rt_zoom_initialized[zi] = true;
+    }
 
-        // Compute y-axis label with ×10^i notation
-        var max_v: f64 = 0;
-        for (inten) |v| {
-            if (v > max_v) max_v = v;
-        }
-        const exp = order_of_magnitude(max_v);
-        var y_label: [64]u8 = undefined;
-        const y_label_z: [:0]const u8 = if (exp == 0)
-            std.fmt.bufPrintZ(&y_label, "Intensity", .{}) catch "Intensity"
-        else
-            std.fmt.bufPrintZ(&y_label, "Intensity (\xc3\x9710^{d})", .{exp}) catch "Intensity";
+    // Compute y-axis label with ×10^i notation
+    var max_v: f64 = 0;
+    for (inten) |v| {
+        if (v > max_v) max_v = v;
+    }
+    const exp = order_of_magnitude(max_v);
+    var y_label: [64]u8 = undefined;
+    const y_label_z: [:0]const u8 = if (exp == 0)
+        std.fmt.bufPrintSentinel(&y_label, "Intensity", .{}, 0) catch "Intensity"
+    else
+        std.fmt.bufPrintSentinel(&y_label, "Intensity (\xc3\x9710^{d})", .{exp}, 0) catch "Intensity";
 
-        const io_ptr = ig.ImGui_GetIO();
-        updateZoomPan(zi, abs_min_rt, abs_max_rt, io_ptr.*.MouseWheel, io_ptr.*.MouseWheelH, io_ptr.*.KeyShift);
+    const io_ptr = ig.ImGui_GetIO();
+    updateZoomPan(self, zi, abs_min_rt, abs_max_rt, io_ptr.*.MouseWheel, io_ptr.*.MouseWheelH, io_ptr.*.KeyShift);
 
-        if (ip.ImPlot_BeginPlot("##Chrom", .{ .x = -1, .y = -1 }, 0)) {
-            defer ip.ImPlot_EndPlot();
+    if (ip.ImPlot_BeginPlot("##Chrom", .{ .x = -1, .y = -1 }, 0)) {
+        defer ip.ImPlot_EndPlot();
 
-            ip.ImPlot_SetupAxis(ip.ImAxis_X1, "Retention Time (min)", 0);
-            ip.ImPlot_SetupAxisLimits(ip.ImAxis_X1, rt_zoom_min[zi], rt_zoom_max[zi], ip.ImPlotCond_Always);
-            ip.ImPlot_SetupAxis(ip.ImAxis_Y1, @as([*c]const u8, y_label_z), 0);
-            ip.ImPlot_SetupAxisLimits(ip.ImAxis_Y1, 0, max_v * 1.05, ip.ImPlotCond_Always);
-            ip.ImPlot_SetupFinish();
-            ip.ImPlot_SetNextLineStyle(.{ .x = 0.2, .y = 0.6, .z = 0.2, .w = 1 }, 1.5);
-            ip.ImPlot_PlotLine_doublePtrdoublePtr("Chromatogram", rt.ptr, inten.ptr, n, 0, 0, @sizeOf(f64));
-        }
+        ip.ImPlot_SetupAxis(ip.ImAxis_X1, "Retention Time (min)", 0);
+        ip.ImPlot_SetupAxisLimits(ip.ImAxis_X1, self.rt_zoom_min[zi], self.rt_zoom_max[zi], ip.ImPlotCond_Always);
+        ip.ImPlot_SetupAxis(ip.ImAxis_Y1, @as([*c]const u8, y_label_z.ptr), 0);
+        ip.ImPlot_SetupAxisLimits(ip.ImAxis_Y1, 0, max_v * 1.05, ip.ImPlotCond_Always);
+        ip.ImPlot_SetupFinish();
+        ip.ImPlot_SetNextLineStyle(.{ .x = 0.2, .y = 0.6, .z = 0.2, .w = 1 }, 1.5);
+        ip.ImPlot_PlotLine_doublePtrdoublePtr("Chromatogram", rt.ptr, inten.ptr, n, 0, 0, @sizeOf(f64));
     }
 }

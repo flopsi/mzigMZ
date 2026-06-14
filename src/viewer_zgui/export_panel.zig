@@ -19,6 +19,8 @@ pub const ExportState = struct {
     output_path: ?[]const u8 = null,
     /// Async future for the export worker.
     future: ?std.Io.Future(void) = null,
+    mutex: std.Io.Mutex = .init,
+    io: std.Io = undefined,
 };
 
 pub fn init() ExportState {
@@ -31,13 +33,15 @@ pub fn deinit(self: *ExportState, allocator: std.mem.Allocator) void {
     self.* = .{};
 }
 
+pub const StartError = std.mem.Allocator.Error;
+
 pub fn start(
     self: *ExportState,
     allocator: std.mem.Allocator,
     state: *AppState,
     format: ExportFormat,
     output_path: []const u8,
-) !void {
+) StartError!void {
     if (self.active) return;
     deinit(self, allocator);
     self.* = .{
@@ -50,7 +54,13 @@ pub fn start(
         .error_message = null,
         .output_path = try allocator.dupe(u8, output_path),
         .future = null,
+        .mutex = .init,
+        .io = state.io,
     };
+    errdefer {
+        if (self.output_path) |p| allocator.free(p);
+        self.* = .{};
+    }
 
     // Clone path for the async task because output_path is owned by ExportState.
     const path_copy = try allocator.dupe(u8, output_path);
@@ -59,20 +69,28 @@ pub fn start(
     const progress = try allocator.create(Progress);
     errdefer allocator.destroy(progress);
     progress.* = .{
+        .mutex = &self.mutex,
+        .io = state.io,
         .current = &self.current_scan,
         .total = self.total_scans,
     };
 
-    const future = state.io.async(exportWorker, .{ allocator, state, format, path_copy, progress });
+    const future = state.io.async(exportWorker, .{ allocator, state, format, path_copy, progress, self });
     self.future = future;
 }
 
 const Progress = struct {
+    mutex: *std.Io.Mutex,
+    io: std.Io,
     current: *usize,
     total: usize,
-};
 
-var export_state: ExportState = .{};
+    pub fn report(self: *Progress, n: usize) void {
+        self.mutex.lockUncancelable(self.io);
+        self.current.* = n;
+        self.mutex.unlock(self.io);
+    }
+};
 
 fn exportWorker(
     allocator: std.mem.Allocator,
@@ -80,6 +98,7 @@ fn exportWorker(
     format: ExportFormat,
     output_path: []const u8,
     progress: *Progress,
+    self: *ExportState,
 ) void {
     defer allocator.destroy(progress);
     defer allocator.free(output_path);
@@ -115,15 +134,15 @@ fn exportWorker(
     // Surface the result to the caller via the ExportState. Because this
     // worker runs on a thread, we mutate ExportState directly; the main
     // thread reads it each frame to update the modal.
-    // TODO: guard with a mutex if ExportState outlives this worker in a
-    // more complex lifetime. For now the modal owns the lifetime.
+    self.mutex.lockUncancelable(self.io);
     if (result) |_| {
         // success
     } else |err| {
-        const msg = std.fmt.allocPrint(allocator, "{s}", .{@errorName(err)}) catch return;
-        export_state.error_message = msg;
+        const msg = std.fmt.allocPrint(allocator, "{s}", .{@errorName(err)}) catch null;
+        self.error_message = msg;
     }
-    @atomicStore(bool, &export_state.done, true, .release);
+    @atomicStore(bool, &self.done, true, .release);
+    self.mutex.unlock(self.io);
 }
 
 /// Draw the export-progress modal. Call every frame while active.
@@ -149,17 +168,23 @@ pub fn draw_modal(self: *ExportState) bool {
         };
         ig.ImGui_TextUnformatted(label);
         const output_path = self.output_path orelse "?";
-        ig.ImGui_Text("%s", @as([*c]const u8, @ptrCast(output_path.ptr)));
+        ig.ImGui_Text("%.*s", @as(c_int, @intCast(output_path.len)), @as([*c]const u8, @ptrCast(output_path.ptr)));
 
         const fraction: f32 = if (self.total_scans == 0)
             -1.0
-        else
-            @as(f32, @floatFromInt(self.current_scan)) / @as(f32, @floatFromInt(self.total_scans));
+        else blk: {
+            self.mutex.lockUncancelable(self.io);
+            const current = self.current_scan;
+            self.mutex.unlock(self.io);
+            break :blk @as(f32, @floatFromInt(current)) / @as(f32, @floatFromInt(self.total_scans));
+        };
         ig.ImGui_ProgressBar(fraction, .{ .x = -1, .y = 0 }, null);
 
-        if (self.done) {
+        if (@atomicLoad(bool, &self.done, .acquire)) {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
             if (self.error_message) |err| {
-                ig.ImGui_TextColored(.{ .x = 1, .y = 0.3, .z = 0.3, .w = 1 }, "Error: %s", @as([*c]const u8, @ptrCast(err.ptr)));
+                ig.ImGui_TextColored(.{ .x = 1, .y = 0.3, .z = 0.3, .w = 1 }, "Error: %.*s", @as(c_int, @intCast(err.len)), @as([*c]const u8, @ptrCast(err.ptr)));
             } else {
                 ig.ImGui_TextUnformatted("Done.");
             }
